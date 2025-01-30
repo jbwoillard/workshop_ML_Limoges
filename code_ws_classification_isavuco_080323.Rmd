@@ -1,0 +1,1414 @@
+---
+title: "Workshop Classification Code"
+author: "jbw"
+date: '2023-03-08'
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Objective
+
+In this course we will try to predict from the isavuconazole simulation a trough concentration at SS lower than 2 mg/L
+
+## Loading the packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr)# pour summary
+library(GGally)# pour graphique summary
+library(tableone)# pour stat descriptive
+tidymodels_prefer()
+library(DALEXtra)# pour explicability
+library(themis)# pour downsample
+library(DataExplorer)
+library(recipeselectors)
+library(naniar)
+library(finetune)
+library(stacks)
+library(vip)
+```
+
+
+
+
+```{r, include = FALSE}
+library(readr)
+
+# import concentrations
+conc_isavuco_5mg_kg <- read_csv("Sim5.csv", col_types = cols(outeq = col_skip())) %>% 
+  mutate(dose_group = "5mg/kg") %>% 
+  # to select less id to run algroihtms fasters
+  filter(id<300)
+conc_isavuco_10mg_kg <- read_csv("Sim10.csv", col_types = cols(outeq = col_skip())) %>% 
+  mutate(dose_group = "10mg/kg") %>% 
+  # to select less id to run algroihtms fasters
+  filter(id<300)
+conc_isavuco_15mg_kg <- read_csv("Sim15.csv", col_types = cols(outeq = col_skip())) %>% 
+  mutate(dose_group = "15mg/kg") %>% 
+  # to select less id to run algroihtms fasters
+  filter(id<300)
+
+conc_isavuco <- conc_isavuco_5mg_kg %>% 
+  bind_rows(conc_isavuco_10mg_kg) %>%
+  bind_rows(conc_isavuco_15mg_kg)
+  
+# import covariates
+cov_isavuco <- read_csv("parValues.csv")
+
+# merge data
+
+isavuco <- conc_isavuco %>% 
+  left_join(cov_isavuco %>% select(id, weight, age)) %>%
+  mutate(dose = case_when(
+    dose_group == "5mg/kg" ~ 5 * weight,
+    dose_group == "10mg/kg" ~ 10 * weight,
+    dose_group == "15mg/kg" ~ 15 * weight
+  ),
+  id = case_when(
+    dose_group == "5mg/kg" ~ str_c(id,"5", sep = "_"),
+    dose_group == "10mg/kg" ~ str_c(id,"10", sep = "_"),
+    dose_group == "15mg/kg" ~ str_c(id,"15", sep = "_")
+  )
+  ) 
+
+```
+
+
+## plot of conc
+
+```{r}
+isavuco %>% ggplot(aes(x = time, y = out)) + 
+  geom_point(alpha = 0.1) + 
+  labs(title = "Individual simulated isavuconazole profiles", x = "'Time (h)", y = "Isavuconazole concentrations (mg/L)") + 
+  theme_bw()
+```
+
+## Creation of the event to be predicted
+
+Extraction of C0 at 192h 
+
+```{r}
+# extraction of C0
+
+creation_event <- isavuco %>% filter(time == 192) %>% 
+  mutate(event = if_else(out > 2, 1, 0), event = as.factor(event)) %>% 
+  select(id, event) 
+
+# plot proportion
+creation_event %>% 
+  ggplot((aes(x=event))) + 
+  geom_bar() + 
+  theme_bw()
+
+# proportion
+creation_event %>% summarise(prop_event = mean(event))
+```
+
+
+## Feature engineering
+
+Extraction of concentrations used as predictor and creation of binned column 
+We will try to predict from concentrations at 48h (trough) to 60h and make selection of important features based on boruta algorithm
+
+
+```{r}
+
+isavuco_pred <- isavuco %>% filter(between(time,48,60)) %>% mutate(
+  ## creation of binned column for time remove after 6h for feasability purpose
+  time_bin = case_when(
+time == 48 ~ "conc_0",
+time == 49 ~"conc_1", 
+time == 50 ~"conc_2",
+time == 51 ~ "conc_3",
+time == 52 ~"conc_4", 
+time == 53 ~"conc_5",
+time == 54 ~ "conc_6",
+TRUE ~ NA
+# time == 55 ~"conc_7", 
+# time == 56 ~"conc_8",
+# time == 57 ~ "conc_9",
+# time == 58 ~"conc_10", 
+# time == 59 ~"conc_11",
+# time == 60 ~"conc_12"
+         )) %>% 
+  filter(!is.na(time_bin))
+## calculation of relative difference between theoretical time and observed time 
+# diff_rel_time = case_when(
+#           time==0 ~ 0,
+#          between(time,0.85,1.15) ~ (time - 1)/1,
+#          between(time,2.8,3.2) ~ (time - 3)/3,
+#          TRUE~100)) %>% filter(diff_rel_time<50) %>% mutate_if(is.character,factor)
+# 
+
+## filter patient with exactly 2 rows for the 2 times
+# isavuco_pred %>% group_by(id) %>% filter(n() == 2) %>% ungroup() 
+
+```
+
+## Preparation of the file for tidymodels
+
+1)  Merge with outcome
+2)  Pivot column to have only one row per patient
+
+```{r}
+# pivot conc
+isavuco_pivot <- isavuco_pred %>% pivot_wider(id_cols=id ,names_from = time_bin, values_from = c(out)) %>%
+## join with variable non pivot
+  left_join(isavuco_pred %>% dplyr::select(id, dose_group:dose)%>% distinct(id,.keep_all = T))
+
+# merge with AUC
+isavuco_ml <- isavuco_pivot %>% left_join(creation_event) 
+
+```
+
+## variable selection
+
+### preparaito of data for vairbale selection
+
+```{r}
+
+# pivot conc for variable selection
+isavuco_pivot_all <- isavuco_pred %>% pivot_wider(id_cols=id ,names_from = time_bin, values_from = c(out)) %>%
+## join with variable non pivot 
+  left_join(isavuco_pred %>% select(-time_bin)) %>%  
+  #oadd the event
+  left_join(creation_event %>% select(id, event)) %>% 
+  #remove unusefull features
+  select( -time, -dose_group, -out) %>% 
+  distinct(conc_0, .keep_all = TRUE)  
+```
+
+
+### random forrest vip plots
+
+```{r}
+
+rf_model <- rand_forest(mode = "classification", trees = 500) %>%
+  set_engine("ranger", importance = "permutation")
+
+rf_fit <- rf_model %>%
+  fit(event ~ ., data = isavuco_pivot_all)
+
+vip(rf_fit)  # Plot feature importance
+```
+
+### Boruta 
+
+How It Works:
+Create Shadow Features
+The method duplicates the original dataset’s predictor variables.
+The duplicated features are randomly shuffled (these are called shadow features).
+These shadow features have no relationship with the outcome variable.
+Train a Random Forest Model
+A random forest classifier is trained on both real and shadow features.
+The model calculates the importance of each feature (real & shadow) based on how well they help in making predictions.
+Compare Real vs. Shadow Features
+Boruta checks whether a real feature is more important than the best shadow feature.
+If a real feature has higher importance than all shadow features, it is kept.
+If a real feature isn’t better than shadow features, it is removed.
+
+```{r}
+library(Boruta)
+
+boruta_model <- Boruta(event ~ ., data = isavuco_pivot_all, doTrace = 2)
+final_features <- getSelectedAttributes(boruta_model, withTentative = TRUE)
+
+print(final_features)  # List of selected features
+
+```
+
+
+### recursive feature elimination
+
+```{r}
+library(caret)
+
+control <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+
+rfe_model <- rfe(isavuco_pivot_all %>% select(-id, -event), isavuco_pivot_all$event,
+                 sizes = c(2,3,4,5, 10), rfeControl = control)
+
+print(rfe_model)  # Selected features
+```
+
+package under developpement
+
+### Boruta feature selection:
+https://towardsdatascience.com/boruta-explained-the-way-i-wish-someone-explained-it-to-me-4489d70e154a
+
+step_select_boruta
+
+```{r}
+
+# # create a preprocessing recipe
+# rec <-
+#  recipe(event ~ ., data = isavuco_ml ) %>%
+#  step_select_boruta(all_predictors(), outcome = "event")
+# 
+# prepped <- prep(rec)
+# prepped
+# 
+# preproc_data <- juice(prepped)
+# preproc_data
+```
+
+### Relief-based feature selection
+
+Relief calculates a feature score for each feature which can then be applied to rank and select top scoring features for feature selection. Alternatively, these scores may be applied as feature weights to guide downstream modeling. Relief feature scoring is based on the identification of feature value differences between nearest neighbor instance pairs. If a feature value difference is observed in a neighboring instance pair with the same class (a 'hit'), the feature score decreases. Alternatively, if a feature value difference is observed in a neighboring instance pair with different class values (a 'miss'), the feature score increases.
+
+```{r}
+# rec <-
+#  recipe(event ~ ., data = isavuco_ml) %>%
+#   step_select_relief(
+#    all_predictors(), 
+#    outcome = "auc",
+#    # top_p = 10,
+#    threshold = 0.8
+#   )
+# 
+# prepped <- prep(rec)
+# 
+# new_data <- bake(prepped, new_data = NULL)
+# new_data
+```
+
+### Selection using maximum Relevancy Minimum Redundancy
+
+Features can be selected in many different ways. One scheme is to select features that correlate strongest to the classification variable. This has been called maximum-relevance selection. Many heuristic algorithms can be used, such as the sequential forward, backward, or floating selections.
+
+On the other hand, features can be selected to be mutually far away from each other while still having "high" correlation to the classification variable. This scheme, termed as Minimum Redundancy Maximum Relevance (mRMR) selection has been found to be more powerful than the maximum relevance selection.
+
+As a special case, the "correlation" can be replaced by the statistical dependency between variables. Mutual information can be used to quantify the dependency. In this case, it is shown that mRMR is an approximation to maximizing the dependency between the joint distribution of the selected features and the classification variable.
+
+step_select_mrmr
+
+```{r}
+# rec <-
+#  recipe(event ~ ., data = isavuco_ml) %>%
+#  step_select_mrmr(
+#    all_predictors(),
+#    outcome = "auc",
+#    # top_p = 5,
+#     threshold = 0.85
+#  )
+# 
+# prepped <- prep(rec)
+# prepped
+# 
+# preproc_data <- juice(prepped)
+# 
+# preproc_data
+
+```
+
+
+
+## creation of informative predictor
+
+Calculation of differences between the remaining concentrations)
+
+```{r}
+isavuco_ml <- isavuco_ml %>% 
+  mutate(diff_conc = conc_1 - conc_0,
+         ratio_conc = conc_1/conc_0) %>% 
+  select(id, conc_0, conc_1, dose_group:event,diff_conc, ratio_conc)
+```
+
+## graphical exploration
+
+Graphical exploraiton boxplots package DataExplorer
+
+```{r}
+# boxplots
+plot_boxplot(isavuco_ml , by ="event", scale_y = "log10", ggtheme = theme_bw()) 
+# variables continues
+plot_histogram(isavuco_ml, scale_x = "log10", ggtheme = theme_bw())  
+
+# variables categorielle
+# par sous-groupes
+plot_bar(isavuco_ml, by ="event") 
+```
+
+```{r}
+ggp <- isavuco_ml %>% select(-id) %>% ggpairs(aes(color = event)) 
+print(ggp, progress = F)
+
+isavuco_ml %>% ggplot(aes(x = conc_0, fill=event)) + geom_density(alpha=0.5) + theme_bw()
+isavuco_ml %>% ggplot(aes(x = conc_1, fill=event)) + geom_density(alpha=0.5) + theme_bw()
+isavuco_ml %>% ggplot(aes(x = dose, fill=event)) + geom_density(alpha=0.5) + theme_bw()
+isavuco_ml %>% ggplot(aes(x = diff_conc, fill=event)) + geom_density(alpha=0.5) + theme_bw()
+```
+
+On va transformer les conc, la dose et les diff entre les conc
+
+## data splitting
+
+```{r}
+set.seed(1234)
+isavuco_split<- initial_split(isavuco_ml, strata = event, prop=3/4)
+isavuco_ml_train  <- training(isavuco_split )
+isavuco_ml_test  <- testing(isavuco_split )
+```
+
+## description dataset train and test
+
+```{r comparaison dataset dev et val pro}
+#cut the 2 vairbales with their names
+isavuco_dev<-isavuco_ml_train %>% mutate (type = "dev")
+isavuco_val<-isavuco_ml_test %>% mutate (type = "val")
+isavuco_des<-full_join(isavuco_dev, isavuco_val)
+
+#recuperation des noms
+# dput(names((isavuco_ml_train)))
+## Vector of categorical variables that need transformation
+catVars <- c("dose_group", "event")
+## Create a variable list.
+vars <- c("conc_0", "conc_1", "dose_group", "weight", "age", "dose", 
+"event", "diff_conc")
+tableOne <- CreateTableOne(vars = vars, strata = "type",factorVars = catVars, data = isavuco_des)
+tableOne2<-print(tableOne, nonnormal = c("conc_0", "conc_1", "weight", "age", "dose",  "diff_conc"), printToggle=F, minMax=T)
+tableOne2b<-print(tableOne, nonnormal = c("conc_0", "conc_1", "weight", "age", "dose",  "diff_conc"), printToggle=F, minMax=F)
+
+```
+
+```{r , echo=F}
+kableone(tableOne2)
+kableone(tableOne2b)
+```
+
+## Resampling object
+
+```{r}
+##hyperparameters
+set.seed(2345)
+folds <- vfold_cv(isavuco_ml_train, strata = event)# by default 1 time but use repeats= to change, v=10 fois, strat to keep the initial distribution 
+
+###resample#####
+set.seed(456)
+folds_cv <- vfold_cv(isavuco_ml_train, strata = event)#par défaut 10 fois
+```
+
+
+## pre processing
+
+<https://recipes.tidymodels.org/reference/index.html>
+
+Normalisations usuelles à appliquer par algortihme utilisés
+https://www.tmwr.org/pre-proc-table.html
+
+```{r recipe xgb }
+
+isavuco_ml_rec  <- recipe(event ~ ., data = isavuco_ml_train) %>%
+  update_role(id, new_role = "id") %>%
+  step_rm(dose_group) %>%
+  step_YeoJohnson(contains("conc"), dose) %>%
+  step_normalize(all_numeric_predictors())  %>%
+  step_downsample()
+# si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
+# si trop de categories reduire avec step_other
+
+isavuco_ml_rec_prep <-  prep(isavuco_ml_rec )
+isavuco_train_recipe <-bake(isavuco_ml_rec_prep, new_data = NULL)
+isavuco_test_recipe <-bake(isavuco_ml_rec_prep, new_data = isavuco_ml_test)
+```
+
+Encoding particulier des variables si nombreux facteurs, on peut remplacer par la valeur moyenne d'outcome (regression) ou la probabilité (classif). Quand peu de valeurs dans une categories, on utilise du partial pooling avec des modeles mixtes --> shrinke ces valeurs vers la moyenne
+
+Example non run of encoding a factor using the mean of the outcome
+
+```{r}
+library(embed)
+# step_lencode_glm(variable_facteur, outcome = vars(outcome)) %>%
+#step_lencode_mixed(variable_facteur , outcome = vars(outcome)) %>%
+# necessite d'etre tune pour eviter overfitting
+#et peu gerer des nouvelles categories
+
+# pour voir valeurs encodées
+# glm_estimates <-
+#   prep(nom_recipe) %>%
+#   tidy(number = 2)# 2 etant la position du step dans la recipe
+
+```
+
+
+## model & workflow Xgboost
+
+https://parsnip.tidymodels.org/reference/boost_tree.html
+
+Parameters to tune
+
+* mtry
+A number for the number (or proportion) of predictors that will be randomly sampled at each split when creating the tree models
+
+* trees
+An integer for the number of trees contained in the ensemble.
+
+* min_n
+An integer for the minimum number of data points in a node that is required for the node to be split further.
+
+* tree_depth
+An integer for the maximum depth of the tree (i.e. number of splits) (specific engines only).
+
+* learn_rate
+A number for the rate at which the boosting algorithm adapts from iteration-to-iteration (specific engines only). This is sometimes referred to as the shrinkage parameter.
+
+* sample_size
+A number for the number (or proportion) of data that is exposed to the fitting routine. For xgboost, the sampling is done at each iteration 
+
+```{r wf xgb 1}
+# #model
+
+
+xgb_spec <- boost_tree(mode = "classification",
+                        mtry = tune(),
+                        trees = tune(),
+                        min_n = tune(),
+                       sample_size = tune(),
+                        tree_depth = tune(),
+                        learn_rate = tune()) %>% set_engine("xgboost")
+
+
+
+#workflow model+recipe
+xgb_wf <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(xgb_spec)
+#
+
+```
+
+Example of tuning with finetune
+
+Race approach:  here, the tuning process evaluates all models on an initial subset of resamples. Based on their current performance metrics, some parameter sets are not considered in subsequent resamples.
+
+```{r fintune race anova, cache=TRUE}
+# library(finetune)
+# 
+# set.seed(234)
+# tune_xgb_ft <-
+#   tune_race_anova(
+#     xgb_wf,
+#     folds,
+#     grid = 50,
+#     metrics = metric_set(mn_log_loss, accuracy),
+#     control = control_race(verbose_elim = TRUE)
+#   )
+# 
+# tune_xgb_ft
+# plot_race(tune_xgb_ft)
+```
+
+```{r wf xgb tune , cache=TRUE}
+
+library(doParallel)
+# Step 1: Set up parallel backend
+num_cores <- parallel::detectCores() - 1  # Use all but one core to leave resources for the system
+cl <- makeCluster(num_cores)             # Create a cluster with the specified number of cores
+registerDoParallel(cl)                   # Register the cluster for parallel processing
+
+# Inform the user about the parallel setup
+message("Parallel backend set up with ", num_cores, " cores.")
+
+# Step 2: Define the tuning process with parallel control
+set.seed(234)  # Set seed for reproducibility
+
+tune_xgb <- tune_grid(
+  xgb_wf,  # Workflow object
+  resamples = folds,  # Cross-validation folds
+  grid = 60,  # Number of tuning parameter combinations
+  control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    parallel_over = "everything" , # Parallelize across resamples and grid combinations
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+# Step 3: Stop the cluster after tuning
+stopCluster(cl)          # Shut down the parallel cluster
+registerDoSEQ()          # Revert to sequential execution
+message("Parallel backend stopped and reverted to sequential execution.")
+
+#View results resultats
+
+autoplot(tune_xgb, scientific = FALSE) +
+  theme_bw() +
+  ggtitle("tuning hyperparameter")
+```
+
+### iterative tuning
+
+During the search process, predict which values to test next.
+*These methods can be used in a second time after a classical tune_grid to optimise the hyperparameters*
+
+#### Simulated annealing
+The process of using simulated annealing starts with an initial value and embarks on a controlled random walk through the parameter space. Each new candidate parameter value is a small perturbation of the previous value that keeps the new point within a local neighborhood.
+
+```{r xgb simulated annealing, cache = TRUE}
+
+# simulated annealing optimisation (library(finetune))
+
+set.seed(1404)
+xgb_sa <-
+  xgb_wf %>%
+  tune_sim_anneal(
+    resamples = folds,
+    initial = tune_xgb,
+    iter = 50,
+    control = control_sim_anneal(verbose = TRUE, no_improve = 10L)
+  )
+
+# visualisation perfs
+autoplot(xgb_sa, type = "performance")
+
+# visualisation params
+autoplot(xgb_sa, type = "parameters")
+```
+
+## Selection of the best model
+
+```{r wf xgb  ,fig.width=10, fig.height=7}
+#visualisation des meilleures combinaisons
+show_best(xgb_sa)
+
+#choix du best model
+best_rmse_xgb <- select_best(xgb_sa)
+
+final_xgb <- finalize_model(
+  xgb_spec,
+  best_rmse_xgb
+)
+
+final_xgb
+```
+
+## finalise workflow
+
+```{r finalise xgb workflow}
+#finalize workflow (fitted)
+final_wf_xgb <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_xgb) %>% 
+  fit(isavuco_ml_train)
+
+#finalize workflow (non fitted for last fit)
+final_wf_xgb_non_fit <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_xgb) 
+
+```
+
+## importance plot
+
+Allows to evlauate which variable are of interest and their weights
+
+```{r wf xgb  importance plot}
+library(vip)
+xgb_fit <- extract_fit_parsnip(final_wf_xgb)
+vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
+```
+
+## finalize workflow and crossval
+
+```{r wf xgb cross val resample}
+
+## 10 fold CV
+xgb_rs<- fit_resamples(object = final_wf_xgb, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+xgb_rs %>% collect_metrics()
+
+xgb_rs%>% collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+
+```
+
+Fit and save wf for future use
+```{r fit and save xgb}
+##fit workflow necessaire pour faire prédiciton à partir de l'objet
+fit_workflow <- fit(final_wf_xgb, isavuco_ml_train)
+
+# ex prediciton à partir du wf pour 3 first patients de train
+set.seed(1234)
+augment(fit_workflow, isavuco_ml_train %>% slice_head(n = 3)) 
+
+ # sauvegarde pour une utilisation ultérieure
+ saveRDS(fit_workflow, file = str_c("xgboost_classif_workshop_save_",today(),".rds"))
+```
+
+Example of prediction in a new patient
+
+```{r}
+## prediction
+dput(names(isavuco_ml_train))
+nouveau_patient <- tibble(id = "toto", conc_0 = 2.8, conc_1 = 5.8,  dose_group = "5mgkg", weight = 20, 
+age = 5, dose = 100,  event =  0, diff_conc = conc_1 - conc_0, ratio_conc = conc_1/conc_0)
+augment(fit_workflow, nouveau_patient)
+```
+
+## linear model for benchmarking
+
+#### model & workflow
+
+https://parsnip.tidymodels.org/reference/linear_reg
+
+* penalty
+A non-negative number representing the total amount of regularization (specific engines only).
+
+* mixture
+A number between zero and one (inclusive) denoting the proportion of L1 regularization (i.e. lasso) in the model.
+
+mixture = 1 specifies a pure lasso model,
+
+mixture = 0 specifies a ridge regression model, and
+
+0 < mixture < 1 specifies an elastic net model, interpolating lasso and ridge.
+
+Here Mixture = 1 allows to have a LASSO penalisation while mixture = 0 is the ridge penalisation
+
+```{r wf lm sim , cache=TRUE, fig.width=10, fig.height=7}
+# #model
+##nouveau parametre stop_iter
+lm_spec <- logistic_reg(mode = "classification",
+                        penalty = tune(),
+                        mixture = 1
+                        ) %>% set_engine("glmnet")
+
+
+#workflow model+recipe
+lm_wf<- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(lm_spec)
+
+# dans le cas d'un modele lineaire non penalise sans preprocessing , on peut aussi utiliser à la place d'add recipe
+# add_formula(auc ~ .)
+
+#tuning
+
+# narrower penalty range
+narrower_penalty <- penalty(range = c(-3, 0))
+
+set.seed(345)
+tune_lm <- tune_grid(
+  lm_wf,
+  resamples = folds,
+  grid = 10,
+   param_info = parameters(narrower_penalty),
+  control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+#visualisatin resultats
+
+autoplot(tune_lm) + 
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+# best_rmse_lm <- select_best(tune_lm, "rmse",  maximize = F)
+
+# choix du modele le plus simple
+best_penalty <- 
+  tune_lm %>%
+  select_by_one_std_err(-penalty, metric = "accuracy")
+
+best_penalty
+
+final_lm <- finalize_model(
+  lm_spec,
+  best_penalty
+)
+
+final_lm
+
+#finalize workflow
+final_wf_lm <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_lm) %>% 
+  fit(isavuco_ml_train)
+
+#vip plot
+lm_fit <- extract_fit_parsnip(final_wf_lm)
+vip(lm_fit, geom = "point", num_features = 20) + theme_bw()
+
+
+set.seed(123)
+lm_rs<- fit_resamples(object = final_wf_lm, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+lm_rs %>% collect_metrics()
+
+lm_rs %>% collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+
+##fit workflow
+fit_workflow_lm <- fit(final_wf_lm, isavuco_ml_train)
+saveRDS(fit_workflow_lm, file = str_c("wf_classification_lm_workshop_save_",today(),".rds"))
+```
+
+## MARS model for benchmarking
+
+#### model & workflow
+
+Multivariate Adaptive Regression Splines, or MARS, is an algorithm for complex non-linear regression problems. The MARS algorithm involves discovering a set of simple piecewise linear functions that characterize the data and using them in aggregate to make a prediction. In a sense, the model is an ensemble of linear functions. 
+Each function is piecewise linear, with a knot at the value t. In the terminology of […], these are linear splines.
+How was the cut point determined? Each data point for each predictor is evaluated as a candidate cut point by creating a linear regression model with the candidate features, and the corresponding model error is calculated.
+Once the full set of features has been created, the algorithm sequentially removes individual features that do not contribute significantly to the model equation. This “pruning” procedure assesses each predictor variable and estimates how much the error rate was decreased by including it in the model.
+
+
+
+https://parsnip.tidymodels.org/reference/details_mars_earth.html
+
+* num_terms
+The number of features that will be retained in the final model, including the intercept.
+
+* prod_degree
+The highest possible interaction degree.
+
+
+```{r wf mars sim , cache=TRUE, fig.width=10, fig.height=7}
+# #model
+##nouveau parametre stop_iter
+mars_spec <- mars(mode = "classification",
+                        num_terms = tune(),
+                        prod_degree = tune()
+                        ) %>% set_engine("earth")
+
+
+#workflow model+recipe
+mars_wf<- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(mars_spec)
+#
+##hyperparameters
+set.seed(2345)
+folds <- vfold_cv(isavuco_ml_train, strata = event)#par défaut 10 fois
+
+#tuning
+set.seed(345)
+tune_mars <- tune_grid(
+  mars_wf,
+  resamples = folds,
+  grid = 20,
+ control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+#visualisatin resultats
+
+autoplot(tune_mars) + 
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+best_rmse_mars <- select_best(tune_mars)
+
+final_mars <- finalize_model(
+  mars_spec,
+  best_rmse_mars
+)
+
+final_mars
+
+#finalize workflow
+final_wf_mars <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_mars) %>% 
+  fit(isavuco_ml_train)
+
+#VIP plot
+mars_fit <- extract_fit_parsnip(final_wf_mars)
+vip(mars_fit, geom = "point", num_features = 20) + theme_bw()
+###resample#####
+set.seed(123)
+mars_rs<- fit_resamples(object = final_wf_mars, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+mars_rs %>% collect_metrics()
+
+mars_rs %>% 
+  collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+##fit workflow
+fit_workflow_mars <- fit(final_wf_mars, isavuco_ml_train)
+  saveRDS(fit_workflow_mars, file = str_c("wf_classification_mars_workshop_save_",today(),".rds"))
+```
+
+## SVM polynomial model for benchmarking
+
+SVM works by mapping data to a high-dimensional feature space so that data points can be categorized, even when the data are not otherwise linearly separable. A separator between the categories is found, then the data are transformed in such a way that the separator could be drawn as a hyperplane. Following this, characteristics of new data can be used to predict the group to which a new record should belong.
+
+#### model & workflow
+
+https://parsnip.tidymodels.org/reference/svm_poly.html
+
+* cost
+A positive number for the cost of predicting a sample within or on the wrong side of the margin
+
+
+
+```{r wf svm sim , cache=TRUE, fig.width=10, fig.height=7}
+#model
+##nouveau parametre stop_iter
+svm_spec <- svm_linear(mode = "classification",
+                        cost = tune()
+                        ) %>% set_engine("kernlab", importance = "permutation")
+
+
+#workflow model+recipe
+svm_wf<- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(svm_spec)
+#
+##hyperparameters
+set.seed(2345)
+folds <- vfold_cv(isavuco_ml_train, strata = event)#par défaut 10 fois
+
+#tuning
+set.seed(345)
+tune_svm <- tune_grid(
+  svm_wf,
+  resamples = folds,
+  grid = 10,
+control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+#visualisatin resultats
+
+autoplot(tune_svm, metric = "accuracy") +
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+best_rmse_svm <- select_best(tune_svm)
+
+final_svm <- finalize_model(
+  svm_spec,
+  best_rmse_svm
+)
+
+final_svm
+
+#visualisation des résultats
+# final_svm %>%
+#   set_engine("kernlab", importance = "permutation") %>%
+#   fit(auc ~ .,
+#       data = juice(isavuco_ml_rec_prep)
+#   ) %>%
+#   vip::vip(geom = "col")
+
+#finalize workflow
+final_wf_svm <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_svm)
+
+###resample#####
+set.seed(456)
+folds_cv<- vfold_cv(isavuco_ml_train, strata = event)#par défaut 10 fois
+set.seed(123)
+svm_rs<- fit_resamples(object = final_wf_svm, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+svm_rs %>% collect_metrics()
+
+svm_rs %>% 
+  collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+##fit workflow
+fit_workflow_svm <- fit(final_wf_svm, isavuco_ml_train)
+ saveRDS(fit_workflow_svm, file = "wf_svm_classif_isavuco_080323.rds")
+```
+
+
+## Benchmark other models
+
+https://www.tidymodels.org/find/parsnip/
+
+For example 
+random_forest: https://parsnip.tidymodels.org/reference/rand_forest.html
+Hyperparameters to tune
+* mtry
+An integer for the number of predictors that will be randomly sampled at each split when creating the tree models.
+
+* trees
+An integer for the number of trees contained in the ensemble.
+
+* min_n
+An integer for the minimum number of data points in a node that are required for the node to be split further.
+null_model: https://parsnip.tidymodels.org/reference/null_model.html
+
+## validation test
+
+Use of Xgb
+
+```{r last fit xgb}
+## last fit
+
+final_res <- final_wf_xgb_non_fit %>% #mettre wf meilleures perf
+  last_fit(isavuco_split)
+
+## performances biais imprecision test
+final_res %>% collect_metrics()
+
+final_res_predictions <- final_res %>% collect_predictions() 
+
+final_res_predictions %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+# accuracy, sens, spec, prec ision, recall=sens, auc roc
+final_res_predictions %>% accuracy(event, .pred_class)
+final_res_predictions %>% yardstick::sens(event, .pred_class) #, event_level="second", estimator = "binary")
+final_res_predictions %>% yardstick::spec(event, .pred_class)
+final_res_predictions %>% yardstick::precision(event, .pred_class)# precision = vpp
+final_res_predictions %>% yardstick::recall(event, .pred_class)# precision = vpp
+final_res_predictions %>% roc_auc(event, .pred_0)
+
+# plot roc curve
+# roc curve
+roc_curve_xgb <- final_res_predictions %>%
+  roc_curve(event, .pred_0) %>%
+  ggplot(aes(1 - specificity, sensitivity)) +
+  geom_abline(lty = 2, color = "gray80", linewidth = 1.5) +
+  geom_path(alpha = 0.8, size = 1.2) +
+  coord_equal() + theme_bw()
+
+roc_curve_xgb
+```
+
+## VIP plot test set
+
+```{r vip test}
+library(vip)
+
+xgb_fit <- extract_fit_parsnip(final_res)
+vip(xgb_fit, geom = "point", num_features = 5) + theme_bw()
+```
+
+## Shapvalues
+
+```{r shap xgb}
+#
+library(shapviz)
+
+# 
+# isavuco_ml_rec  <- recipe(event ~ ., data = isavuco_ml_train) %>%
+#   update_role(id, new_role = "id") %>%
+#   step_rm(dose_group) %>%
+#   step_YeoJohnson(contains("conc"), dose) %>%
+#   step_normalize(all_numeric_predictors())  %>%
+#   step_downsample()
+# # si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
+# # si trop de categories reduire avec step_other
+# 
+# isavuco_ml_rec_prep <-  prep(isavuco_ml_rec )
+# isavuco_train_recipe <-bake(isavuco_ml_rec_prep, new_data = NULL)
+# isavuco_test_recipe <-bake(isavuco_ml_rec_prep, new_data = isavuco_ml_test)
+
+
+xgb_test_recipe_shap <- bake(
+  prep(isavuco_ml_rec), 
+  has_role("predictor"),
+  new_data = isavuco_ml_test, 
+  composition = "matrix"
+)
+
+
+shap <- shapviz(extract_fit_engine(final_wf_xgb), X_pred = xgb_test_recipe_shap, X = isavuco_test_recipe)
+
+
+# Generate SHAP importance plots
+shap_imp <- sv_importance(shap, kind = "both", show_numbers = TRUE, max_display = 40L) +
+  ggtitle("SHAP Importance")
+
+# Display the plots
+print(shap_imp)
+
+```
+
+dependence plots
+
+```{r dep plot shap}
+# Generate dependence plots for each class
+dep_plot <- sv_dependence(shap, "ratio_conc", color_var = "dose") +
+  ggtitle("Dependence Plot")
+
+# Display the plots
+print(dep_plot)
+
+```
+
+individual force plot
+
+```{r force plot shap}
+# Generate force plot for Class 1
+force_plot <- sv_force(shap, row_id = 1) +
+  ggtitle("Force Plot")
+
+# Display the plots
+print(force_plot)
+```
+
+## Explainer
+
+```{r explainer xgb dalex}
+## creation of explainer
+explainer_external <- explain_tidymodels(
+  model = fit_workflow, 
+  data = isavuco_ml_train, 
+  y = isavuco_ml_train$event,
+  label = "xgb")
+```
+
+### Breakdown plot
+
+https://github.com/pbiecek/breakDown & https://arxiv.org/abs/1804.01955
+
+
+There are multiple possible approaches to understanding why a model predicts a given class. One is a break-down explanation: it computes how contributions attributed to individual features change the mean model’s prediction for a particular observation.
+
+```{r bd plot}
+bd_plot <- predict_parts(explainer = explainer_external,
+                       new_observation = slice_sample(isavuco_ml_test, n=1),
+                       type = "break_down")
+plot(bd_plot, max_features = 5)
+```
+
+### Partial dependence plot
+
+Partial dependence profiles show how the expected value of a model prediction changes as a function of a feature.
+
+```{r pdp plot}
+pdp_diff_conc_12_0 <- model_profile(
+  explainer_external,
+  variables = "diff_conc",
+  N = NULL # nombre observation a utilsier de notre trainiong set si null=all
+)
+plot(pdp_diff_conc_12_0)
+```
+
+# Particular case of equivocal
+
+If a model result indicated that you had a 51% chance of having contracted COVID-19, it would be natural to view the diagnosis with some skepticism
+
+```{r equivocal}
+test_pred <- augment(fit_workflow, isavuco_ml_test)
+test_pred %>% head()
+
+## creation d'une zone equivoque
+library(probably)
+
+lvls <- levels(isavuco_ml_train$event)
+
+test_pred <- 
+  test_pred %>% 
+  mutate(.pred_with_eqz = make_two_class_pred(.pred_0, lvls, buffer = 0.15))
+
+test_pred %>% count(.pred_with_eqz) # Rows that are within 0.50±0.15 are given a value of [EQ]
+
+# All data
+test_pred %>% conf_mat(event, .pred_class)
+
+# Reportable results only: 
+test_pred %>% conf_mat(event, .pred_with_eqz)
+```
+
+Possibility to tune the threshold for equivocal
+
+```{r tune threshold equivocal}
+# A function to change the buffer then compute performance.
+eq_zone_results <- function(buffer) {
+  test_pred <- 
+    test_pred %>% 
+    mutate(.pred_with_eqz = make_two_class_pred(.pred_0, lvls, buffer = buffer))
+  acc <- test_pred %>% accuracy(event, .pred_with_eqz)
+  rep_rate <- reportable_rate(test_pred$.pred_with_eqz)
+  tibble(accuracy = acc$.estimate, reportable = rep_rate, buffer = buffer)
+}
+
+# Evaluate a sequence of buffers and plot the results. 
+map_dfr(seq(0, .1, length.out = 20), eq_zone_results) %>% 
+  pivot_longer(c(-buffer), names_to = "statistic", values_to = "value") %>% 
+  ggplot(aes(x = buffer, y = value, lty = statistic)) + 
+  geom_step(size = 1.2, alpha = 0.8) + 
+  labs(y = NULL, lty = NULL)+ 
+  theme_bw()
+```
+
+
+# Applicability domain
+
+The approach used is a fairly simple unsupervised method that attempts to measure how much (if any) a new data point is beyond the training data.
+The idea is to accompany a prediction with a score that measures how similar the new point is to the training set.
+A percentile can be computed for new samples that reflect how much of the training set is less extreme than the new samples.
+
+```{r explicability domain}
+library(applicable)
+pca_stat <- apd_pca(isavuco_ml_rec, data = isavuco_ml_train , threshold = 0.95)
+pca_stat
+
+autoplot(pca_stat, distance) + labs(x = "distance")
+```
+
+Compute percentile in new data
+
+```{r}
+score(pca_stat, isavuco_ml_test %>% slice_sample(n=1)) %>% select(starts_with("distance")) %>% arrange(desc(distance_pctl))
+```
+
+# Ensemble models
+
+```{r ensemble stack blend}
+isavuco_classif_model_st <- 
+  # initialize the stack
+  stacks() %>%
+  # add candidate members
+  add_candidates(tune_xgb) %>%
+  add_candidates(tune_lm) %>%
+  add_candidates(tune_mars) %>%
+  add_candidates(tune_svm) %>%
+  # determine how to combine their predictions
+  blend_predictions() %>%
+  # fit the candidates with nonzero stacking coefficients
+  fit_members()
+
+isavuco_classif_model_st
+```
+
+### Autoplot
+
+To make sure that we have the right trade-off between minimizing the number of members and optimizing performance we use autoplot
+If these results were not good enough, blend_predictions() could be called again with different values of penalty. As it is, blend_predictions() picks the penalty parameter with the numerically optimal results.
+
+```{r}
+autoplot(isavuco_classif_model_st)
+autoplot(isavuco_classif_model_st, type = "members")
+autoplot(isavuco_classif_model_st, type = "weights")
+```
+
+### Make predictions in the test set
+
+```{r}
+
+# ======================================================
+# 1️⃣ Generate Predictions: Probability & Class Labels
+# ======================================================
+
+# Generate probability predictions (for ROC & PR curves)
+isavuco_class_pred_prob <- isavuco_ml_test %>%
+  bind_cols(predict(isavuco_classif_model_st, ., type = "prob"))
+
+# Generate class predictions (for classification metrics & confusion matrix)
+isavuco_class_pred_class <- isavuco_ml_test %>%
+  bind_cols(predict(isavuco_classif_model_st, ., type = "class"))
+
+# Ensure `event` is a factor with correct levels
+isavuco_class_pred_class <- isavuco_class_pred_class %>%
+  mutate(event = factor(event))  # Ensures classification metrics work properly
+
+# ======================================================
+# 2️⃣ Define and Compute Classification Metrics
+# ======================================================
+
+# Define classification metrics (for class predictions)
+class_metrics <- metric_set(accuracy, f_meas, sens, spec, ppv, npv)
+
+# Compute classification metrics using **class predictions**
+classification_results <- isavuco_class_pred_class %>%
+  class_metrics(truth = event, estimate = .pred_class)
+
+# Compute AUC for each model (for ROC & PR curve legends) using **probability predictions**
+auc_values <- isavuco_class_pred_prob %>%
+  pivot_longer(cols = starts_with(".pred_0"), names_to = "model", values_to = "probability") %>%
+  group_by(model) %>%
+  summarise(roc_auc = roc_auc_vec(event, probability),
+            pr_auc = pr_auc_vec(event, probability))
+
+# Convert AUC values to a formatted string for legend labels
+auc_labels <- auc_values %>%
+  mutate(label = paste0(model, " (ROC AUC: ", round(roc_auc, 3), ", PR AUC: ", round(pr_auc, 3), ")"))
+
+# ======================================================
+# 3️⃣ Compute ROC Curve for Probability Predictions
+# ======================================================
+
+# Reshape probability predictions for ROC analysis
+roc_curve_data <- isavuco_class_pred_prob %>%
+  pivot_longer(cols = starts_with(".pred_0"), names_to = "model", values_to = "probability") %>%
+  mutate(probability = as.numeric(probability)) %>%  # Ensure numeric
+  group_by(model) %>%
+  roc_curve(event, probability) %>%
+  ungroup() %>%
+  left_join(auc_labels, by = "model")  # Add AUC labels to dataset
+
+# ======================================================
+# 4️⃣ Compute Precision-Recall (PR) Curve
+# ======================================================
+
+# Reshape probability predictions for PR curve analysis
+pr_curve_data <- isavuco_class_pred_prob %>%
+  pivot_longer(cols = starts_with(".pred_0"), names_to = "model", values_to = "probability") %>%
+  mutate(probability = as.numeric(probability)) %>%  # Ensure numeric
+  group_by(model) %>%
+  pr_curve(event, probability) %>%
+  ungroup() %>%
+  left_join(auc_labels, by = "model")  # Add AUC labels to dataset
+
+# ======================================================
+# 5️⃣ Plot ROC Curve (with AUC in Legend)
+# ======================================================
+
+roc_curve_plot <- ggplot(roc_curve_data, aes(x = 1 - specificity, y = sensitivity, color = label)) +
+  geom_abline(lty = 2, color = "gray80", linewidth = 1.2) +  # Diagonal reference line
+  geom_path(size = 1.2, alpha = 0.8) +  # ROC curves
+  labs(title = "ROC Curves for Stacked Model and Members",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)",
+       color = "Model (AUC Values)") +
+  coord_equal() +
+  theme_bw()
+
+# ======================================================
+# 6️⃣ Plot Precision-Recall (PR) Curve (with AUC in Legend)
+# ======================================================
+
+pr_curve_plot <- ggplot(pr_curve_data, aes(x = recall, y = precision, color = label)) +
+  geom_path(size = 1.2, alpha = 0.8) +  # PR curves
+  labs(title = "Precision-Recall Curves for Stacked Model and Members",
+       x = "Recall (Sensitivity)",
+       y = "Precision (Positive Predictive Value)",
+       color = "Model (AUC Values)") +
+  theme_bw()
+
+# ======================================================
+# 7️⃣ Compute and Display Confusion Matrix (Contingency Table)
+# ======================================================
+
+confusion_matrix_results <- isavuco_class_pred_class %>%
+  conf_mat(truth = event, estimate = .pred_class)
+
+# ======================================================
+# 8️⃣ Display All Results
+# ======================================================
+
+# Print classification metrics
+print(classification_results)
+
+# Print AUC values table
+print(auc_values)
+
+# Print contingency table
+print(confusion_matrix_results)
+
+# Print ROC Curve
+print(roc_curve_plot)
+
+# Print PR Curve
+print(pr_curve_plot)
+
+```
+
+
+
+### with members separately
+
+```{r}
+# ==========================================
+# 1️⃣ Generate Predictions for Each Model Member
+# ==========================================
+# Generate class predictions for each ensemble member from the stacked model
+isavuco_class_pred <- isavuco_ml_test %>%
+  select(event) %>%  # Keep only the target variable (ground truth)
+  bind_cols(
+    predict(
+      isavuco_classif_model_st,  # Stacked model
+      isavuco_ml_test, 
+      type = "class",   # Predict class labels
+      members = TRUE    # Include individual model predictions from the stack
+    )
+  )
+
+# Print the first few rows to verify the structure
+head(isavuco_class_pred)
+
+# ==========================================
+# 2️⃣ Evaluate Individual Model Performance
+# ==========================================
+# Compute classification accuracy for each ensemble member
+pred_class_isavuco <- map(
+  colnames(isavuco_class_pred)[-1],  # Exclude 'event' column from the loop
+  ~ mean(isavuco_class_pred$event == pull(isavuco_class_pred, .x)) # Compare truth vs predictions
+) %>%
+  set_names(colnames(isavuco_class_pred)[-1]) %>%  # Set model names
+  enframe(name = "model", value = "accuracy")  # Convert list to tibble
+
+# ==========================================
+# 3️⃣ Display Results in a Table
+# ==========================================
+rmarkdown::paged_table(pred_class_isavuco)
+```
+
+overall roc curves
+
+```{r}
+
+# generaiotn of probabilities
+
+# Generate probability predictions for each ensemble member
+isavuco_class_pred <- isavuco_ml_test %>%
+  select(event) %>%
+  bind_cols(
+    predict(
+      isavuco_classif_model_st,  # Stacked model
+      isavuco_ml_test, 
+      type = "prob",   # Ensure predictions are probabilities
+      members = TRUE   
+    )
+  )
+# Reshape the data to long format for multiple ROC curves
+roc_curve_data <- isavuco_class_pred %>%
+  pivot_longer(cols = starts_with(".pred_0"), names_to = "model", values_to = "probability") %>%
+  mutate(probability = as.numeric(probability)) %>%  # Ensure numeric probabilities
+  group_by(model) %>%
+  roc_curve(event, probability) %>%
+  ungroup()
+
+# Plot ROC Curves for all models
+roc_curve_plot <- ggplot(roc_curve_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_abline(lty = 2, color = "gray80", linewidth = 1.2) +  # Diagonal reference line
+  geom_path(size = 1.2, alpha = 0.8) +  # ROC curves
+  labs(title = "ROC Curves for Stacked Model and Members",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)",
+       color = "Model") +
+  coord_equal() +
+  theme_bw()
+
+roc_curve_plot
+```
+
