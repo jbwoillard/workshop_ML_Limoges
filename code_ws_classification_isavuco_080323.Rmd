@@ -1,7 +1,7 @@
 ---
 title: "Workshop Classification Code"
 author: "jbw"
-date: '2023-03-08'
+date: '2025-02-05'
 output:
   html_document:
     code_folding: hide
@@ -13,7 +13,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # Objective
 
-In this course we will try to predict from the isavuconazole simulation a trough concentration at SS lower than 2 mg/L
+In this course we will try to predict from the isavuconazole simulation a trough concentration at SS higher than 2 mg/L
 
 ## Loading the packages
 
@@ -27,7 +27,7 @@ tidymodels_prefer()
 library(DALEXtra)# pour explicability
 library(themis)# pour downsample
 library(DataExplorer)
-library(recipeselectors)
+#library(recipeselectors)
 library(naniar)
 library(finetune)
 library(stacks)
@@ -94,11 +94,27 @@ isavuco %>% ggplot(aes(x = time, y = out)) +
 Extraction of C0 at 192h 
 
 ```{r}
+#histogram of c0 at SS
+isavuco %>% 
+  filter(time == 192) %>% 
+  ggplot(aes(x = out)) + 
+  geom_histogram() + 
+  labs(title = "Distribution of the simulated C0 at steady state", x = "'C0 isavuconazole") + 
+  theme_bw() +
+  geom_vline(xintercept = 2)# +
+#  scale_x_continuous(trans=scales::pseudo_log_trans(base = 10))
+
+# summarise of C0 distribution
+isavuco %>% 
+  filter(time == 192) %>% 
+  summarise(mean_c0 = mean(out), min_c0 = min(out), max_c0 = max(out))
+
 # extraction of C0
 
-creation_event <- isavuco %>% filter(time == 192) %>% 
-  mutate(event = if_else(out > 2, 1, 0), event = as.factor(event)) %>% 
-  select(id, event) 
+creation_event <- isavuco %>% 
+  filter(time == 192) %>% 
+  mutate(event_numeric = if_else(out > 2, 1, 0), event = as.factor(event_numeric)) %>% 
+  select(id, event, event_numeric) 
 
 # plot proportion
 creation_event %>% 
@@ -107,7 +123,7 @@ creation_event %>%
   theme_bw()
 
 # proportion
-creation_event %>% summarise(prop_event = mean(event))
+creation_event %>% summarise(prop_event = mean(event_numeric, na.rm=TRUE))
 ```
 
 
@@ -307,7 +323,33 @@ step_select_mrmr
 
 ```
 
+Create a custom metric f_meas_with beta=2
 
+```{r}
+# Vectorized function for F-measure with beta = 2
+f_meas_beta2_vec <- function(truth, estimate, na_rm = TRUE, ...) {
+  yardstick::f_meas_vec(truth, estimate, beta = 2, na_rm = na_rm, ...)
+}
+# Data frame function for F-measure with beta = 2
+f_meas_beta2 <- function(data, truth, estimate, na_rm = TRUE, ...) {
+  truth <- rlang::enquo(truth)
+  estimate <- rlang::enquo(estimate)
+  
+  yardstick::metric_summarizer(
+    metric_nm = "f_meas_beta2",
+    metric_fn = f_meas_beta2_vec,
+    data = data,
+    truth = !!truth,
+    estimate = !!estimate,
+    na_rm = na_rm,
+    ...
+  )
+}
+# Register the custom metric
+f_meas_beta2 <- yardstick::new_class_metric(f_meas_beta2, direction = "maximize")
+
+
+```
 
 ## creation of informative predictor
 
@@ -344,6 +386,47 @@ isavuco_ml %>% ggplot(aes(x = conc_1, fill=event)) + geom_density(alpha=0.5) + t
 isavuco_ml %>% ggplot(aes(x = dose, fill=event)) + geom_density(alpha=0.5) + theme_bw()
 isavuco_ml %>% ggplot(aes(x = diff_conc, fill=event)) + geom_density(alpha=0.5) + theme_bw()
 ```
+
+### data exploraiton PCA
+
+```{r}
+# Load necessary libraries
+library(ggrepel)  # For labeling points in PCA plot
+
+# Assuming your dataset is called `isavuco_ml_train`
+# Select relevant columns (continuous variables and event for coloring)
+pca_data <- isavuco_ml %>%
+  select(conc_0, conc_1, weight, age, dose, diff_conc, ratio_conc, event) %>%
+  mutate(event = as.factor(event))  # Ensure event is a factor for coloring
+
+# Define PCA recipe
+pca_recipe <- recipe(~., data = pca_data) %>%
+  step_normalize(all_numeric_predictors()) %>%  # Normalize numeric variables
+  step_pca(all_numeric_predictors(), num_comp = 2)  # Perform PCA with 2 components
+
+# Prepare the recipe
+pca_prep <- prep(pca_recipe)
+
+# Apply PCA transformation
+pca_transformed <- bake(pca_prep, new_data = pca_data)
+
+# Combine PCA results with event variable
+pca_transformed <- pca_transformed %>%
+  bind_cols(select(pca_data, event))
+
+# Plot PCA results
+ggplot(pca_transformed, aes(x = PC1, y = PC2, color = event)) +
+  geom_point(alpha = 0.8, size = 3) +  # Scatter plot of PCA
+  scale_color_manual(values = c("red", "blue")) +  # Color by event (0=red, 1=blue)
+  labs(title = "PCA Analysis of Continuous Variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Event") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+```
+
 
 On va transformer les conc, la dose et les diff entre les conc
 

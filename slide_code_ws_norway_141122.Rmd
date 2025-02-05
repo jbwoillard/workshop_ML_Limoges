@@ -1,7 +1,7 @@
 ---
-title: "Workshop Norway Code"
+title: "Workshop ml Limoges"
 author: "jbw"
-date: '2022-11-14'
+date: '2025-02-04'
 output:
   html_document:
     code_folding: hide
@@ -24,7 +24,7 @@ library(blandr)
 library(ggcorrplot)
 #library(colino) # en developpement
 #devtools::install_github("stevenpawley/recipeselectors")
-library(recipeselectors)
+# library(recipeselectors)
 tidymodels_prefer()
 library(DALEXtra)
 library(DataExplorer)
@@ -34,6 +34,7 @@ library(stacks)
 library(vip)
 ```
 
+Loading of the data 
 
 ```{r, include = FALSE}
 library(readr)
@@ -42,7 +43,7 @@ library(readr)
 conc_isavuco_5mg_kg <- read_csv("Sim5.csv", 
     col_types = cols(outeq = col_skip())) %>% 
   mutate(dose_group = "5mg/kg") %>% 
-  # to select less id to run algroihtms fasters
+  # to select less id to run algorithms fasters
   filter(id<300)
 conc_isavuco_10mg_kg <- read_csv("Sim10.csv", 
     col_types = cols(outeq = col_skip())) %>% 
@@ -112,7 +113,9 @@ trap1 <- isavuco %>%
 
 ## plot of AUC ref
 
-trap1 %>% ggplot(aes(x = auc_024)) + 
+trap1 %>% 
+  filter(time == 192) %>% 
+  ggplot(aes(x = auc_024)) + 
   geom_histogram() + 
   labs(title = "Distribution of the simulated AUC at steady state", x = "'AUC isavuconazole") + 
   theme_bw() +
@@ -125,7 +128,10 @@ trap1 %>% ggplot(aes(x = auc_024)) +
 We have to remove extreme auc values "outliers, let's remove 1% of the observations at the 2 extrems
 
 ```{r}
-table_quant <- trap1 %>% ungroup() %>% reframe(quantiles = quantile(auc_024, c(0.01, 0.5, 0.99)), q = c(0.01, 0.5, 0.99), n = n())
+table_quant <- trap1 %>% 
+  filter(time == 192) %>% 
+  ungroup() %>% 
+  reframe(quantiles = quantile(auc_024, c(0.01, 0.5, 0.99)), q = c(0.01, 0.5, 0.99), n = n())
 quantile_1 = table_quant [[1,1]]
 quantile_99 = table_quant [[3,1]]
 ```
@@ -140,7 +146,9 @@ We will try to predict from concentrations at 48h (trough) to 60h and make selec
 
 ```{r}
 
-isavuco_pred <- isavuco %>% filter(between(time,48,60)) %>% mutate(
+isavuco_pred <- isavuco %>% 
+  filter(between(time,48,60)) %>% 
+  mutate(
   ## creation of binned column for time
   time_bin = case_when(
 time == 48 ~ "conc_0",
@@ -179,13 +187,16 @@ TRUE ~ NA
 
 ```{r}
 # pivot conc
-isavuco_pivot <- isavuco_pred %>% pivot_wider(id_cols=id ,names_from = time_bin, values_from = c(out)) %>%
+isavuco_pivot <- isavuco_pred %>% 
+  pivot_wider(id_cols=id ,names_from = time_bin, values_from = c(out)) %>%
 ## join with variable non pivot
-  left_join(isavuco_pred %>% dplyr::select(id, dose_group:dose)%>% distinct(id,.keep_all = T))
+  left_join(isavuco_pred %>% dplyr::select(id, dose_group:dose) %>% 
+              distinct(id,.keep_all = T))
 
 
 # merge with AUC
-isavuco_ml <- isavuco_pivot %>% left_join(trap1) %>% 
+isavuco_ml <- isavuco_pivot %>% 
+  left_join(trap1) %>% 
   #remove extreme AUC values
   filter(between(auc_024, quantile_1, quantile_99)) %>% 
   select(-out, -time) %>% 
@@ -218,8 +229,9 @@ isavuco_pivot_all <- isavuco_pred %>% pivot_wider(id_cols=id ,names_from = time_
 rf_model <- rand_forest(mode = "regression", trees = 500) %>%
   set_engine("ranger", importance = "permutation")
 
-rf_fit <- rf_model %>%
-  fit(auc_024 ~ ., data = isavuco_pivot_all)
+rf_fit <- rf_model  %>% 
+  fit(auc_024 ~ ., data = isavuco_pivot_all %>%
+  dplyr::select(-id, -out))
 
 vip(rf_fit)  # Plot feature importance
 ```
@@ -267,7 +279,9 @@ isavuco_ml <- isavuco_ml %>%
 ## graphical exploration
 
 ```{r}
-ggp <- isavuco_ml %>% select(-id) %>% ggpairs(aes(color = dose_group)) 
+ggp <- isavuco_ml %>% 
+  select(-id) %>% 
+  ggpairs(aes(color = dose_group)) 
 print(ggp, progress = F)
 
 isavuco_ml %>% ggplot(aes(x = conc_0)) + geom_histogram()
@@ -276,6 +290,9 @@ isavuco_ml %>% ggplot(aes(x = dose)) + geom_histogram()
 isavuco_ml %>% ggplot(aes(x = diff_conc)) + geom_histogram()
 isavuco_ml %>% ggplot(aes(x = ratio_conc)) + geom_histogram()
 ```
+
+Correlation matrix for continuous data only
+
 ```{r}
 ##Correlation Analysis
   cor_data <- cor(isavuco_ml %>% select_if(is.numeric), use = "complete.obs")
@@ -311,7 +328,7 @@ We will log transform concentrations, amount, and diff and ratio of concentratio
 
 ## data splitting
 
-Funciton usefull for longitudinal data (PK data)
+Function usefull for longitudinal data (PK data)
  : group_initial_split(Orthodont, group = Subject, prop = 2 / 3) ; this is not the case here
  
 ```{r}
@@ -379,6 +396,7 @@ https://www.tmwr.org/pre-proc-table.html
 isavuco_ml_rec  <- recipe(auc_024 ~ ., data = isavuco_ml_train) %>%
   update_role(id, new_role = "id") %>% 
   step_rm(dose_group) %>%
+  step_zv(all_predictors()) %>% 
   step_log(contains("conc"), offset = 0.0001) %>%
   step_YeoJohnson(dose) %>%
   step_normalize(all_numeric_predictors()) 
@@ -444,7 +462,8 @@ xgb_spec <- boost_tree(mode = "regression",
                         min_n = tune(),
                        sample_size = tune(),
                         tree_depth = tune(),
-                        learn_rate = tune()) %>% set_engine("xgboost")
+                        learn_rate = tune()) %>% 
+  set_engine("xgboost")
 
 
 
@@ -459,11 +478,11 @@ xgb_wf <- workflow() %>%
 By default, hyperparameters values prespecified and optimsed for hyperparameters, however, it is possible to change. For example, mtry max is caluclated automatically when fitting from the number of fetaures (sqrt(param))
 
 ```{r}
-xgb_wf %>% extract_parameter_dials("mtry")
-
-# update value
-xgb_param <- extract_parameter_set_dials(xgb_wf) %>% 
-  update(mtry = mtry(c(2, 7)))
+# xgb_wf %>% extract_parameter_dials("mtry")
+# 
+# # update value
+# xgb_param <- extract_parameter_set_dials(xgb_wf) %>% 
+#   update(mtry = mtry(c(2, 7)))
 ```
 
 ### Example of grid for tuning 
@@ -471,14 +490,14 @@ xgb_param <- extract_parameter_set_dials(xgb_wf) %>%
 Space-filling designs can be very effective at representing the parameter space. The default design used by the tune package is the maximum entropy design. These tend to produce grids that cover the candidate space well and drastically increase the chances of finding good results.
 
 ```{r}
-# reguliere
-grid_regular(xgb_param, levels = 2)
-
-# irreguliere
-set.seed(1301)
-xgb_param %>% 
-grid_latin_hypercube(size = 20) %>% # 'size' is the number of combinations
-  summary()
+# # reguliere
+# grid_regular(xgb_param, levels = 2)
+# 
+# # irreguliere
+# set.seed(1301)
+# xgb_param %>% 
+# grid_latin_hypercube(size = 20) %>% # 'size' is the number of combinations
+#   summary()
 ```
 
 ## Tuning the hyperparameters
@@ -487,7 +506,7 @@ With paralell processing
 
 <https://www.tidymodels.org/start/tuning/> <https://www.tidymodels.org/learn/work/bayes-opt/>
 
-```{r wf xgb tune , cache=T, fig.width=10, fig.height=7}
+```{r wf xgb tune , cache=TRUE, fig.width=10, fig.height=7}
 
 library(doParallel)
 # Step 1: Set up parallel backend
@@ -598,7 +617,7 @@ xgb_sa <-
   tune_sim_anneal(
     resamples = folds,
     initial = tune_xgb,
-    iter = 50,
+    iter = 30,
     control = control_sim_anneal(verbose = TRUE, no_improve = 10L)
   )
 
@@ -646,12 +665,12 @@ final_wf_xgb_non_fit <- workflow() %>%
 
 ## importance plot
 
-Allows to evlauate which variable are of interest and their weights
+Allows to evaluate which variable are of interest and their weights
 
 ```{r wf xgb  importance plot}
 library(vip)
 xgb_fit <- extract_fit_parsnip(final_wf_xgb)
-vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
+vip(xgb_fit, geom = "point", num_features = 10) + theme_bw()
 
 ```
 
@@ -693,7 +712,7 @@ Fit and save wf for future use
 fit_workflow <- fit(final_wf_xgb, isavuco_ml_train)
 
 # ex prediciton à partir du wf pour 3 first patients de train
-augment(fit_workflow, isavuco_ml_train %>% slice_head(n =3))
+augment(fit_workflow, isavuco_ml_train %>% slice_tail(n =3))
 
 # sauvegarde pour une utilisation ultérieure
  saveRDS(fit_workflow, file = str_c("xgboost_workshop_save_",today(),".rds"))
@@ -704,7 +723,7 @@ Example of prediction in a new patient
 
 ```{r}
 ## prediction
-dput(names(isavuco_ml_train))
+#dput(names(isavuco_ml_train))
 nouveau_patient <- tibble(id = "toto", conc_0 = 2.8, conc_1 = 5.8,  dose_group = "5mgkg", weight = 20, 
 age = 5, dose = 100,  auc_024 =  38, diff_conc = conc_1 - conc_0, ratio_conc = conc_1/conc_0)
 predict(fit_workflow, nouveau_patient)
@@ -736,7 +755,8 @@ Here Mixture = 1 allows to have a LASSO penalisation while mixture = 0 is the ri
 lm_spec <- linear_reg(mode = "regression",
                         penalty = tune(),
                         mixture = 1
-                        ) %>% set_engine("glmnet")
+                        ) %>% 
+  set_engine("glmnet")
 
 
 #workflow model+recipe
@@ -771,9 +791,11 @@ autoplot(tune_lm, metric = "rmse",  scientific = FALSE) +
 # best_rmse_lm <- select_best(tune_lm, "rmse",  maximize = F)
 
 # choice of the simplest model
-best_penalty <- 
-  tune_lm %>%
-  select_by_one_std_err(-penalty, metric = "rmse")
+# best_penalty <- 
+#   tune_lm %>%
+#   select_by_one_std_err(-penalty, metric = "rmse")
+
+best_penalty <- tune_lm %>% select_best()
 
 best_penalty
 
@@ -1037,6 +1059,231 @@ fit_workflow_svm <- fit(final_wf_svm, isavuco_ml_train)
  saveRDS(fit_workflow_svm, file = str_c("wf_reg_svm_workshop_save_",today(),".rds"))
 ```
 
+## MLP : Multilayer perceptron via brulee
+
+#### model & workflow
+
+Tuning Parameters
+This model has 6 tuning parameters:
+
+hidden_units: # Hidden Units (type: integer, default: 3L)
+
+penalty: Amount of Regularization (type: double, default: 0.0)
+
+epochs: # Epochs (type: integer, default: 100L)
+
+dropout: Dropout Rate (type: double, default: 0.0)
+
+learn_rate: Learning Rate (type: double, default: 0.01)
+
+activation: Activation Function (type: character, default: ‘relu’)
+
+```{r wf mlp sim , cache=T, fig.width=10, fig.height=7}
+#model
+##nouveau parametre stop_iter
+mlp_spec <- mlp(mode = "regression",
+                        hidden_units = tune(),
+                        dropout = tune(),
+                        learn_rate = tune()
+                        ) %>% set_engine("brulee", importance = "permutation")
+
+
+#workflow model+recipe
+mlp_wf<- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(mlp_spec)
+#
+
+library(doParallel)
+# Step 1: Set up parallel backend
+num_cores <- parallel::detectCores() - 1  # Use all but one core to leave resources for the system
+cl <- makeCluster(num_cores)             # Create a cluster with the specified number of cores
+registerDoParallel(cl)                   # Register the cluster for parallel processing
+
+# Inform the user about the parallel setup
+message("Parallel backend set up with ", num_cores, " cores.")
+
+# Step 2: Define the tuning process with parallel control
+set.seed(234)  # Set seed for reproducibility
+
+tune_mlp <- tune_grid(
+  mlp_wf,
+  resamples = folds,
+  grid = 30, 
+  control = control_grid(
+        allow_par = TRUE,        # Enable parallel processing
+    parallel_over = "everything",  # Parallelize across resamples and grid combinations,
+    verbose = TRUE, 
+    save_pred = TRUE, 
+    save_workflow = TRUE
+  )
+)
+
+# Step 3: Stop the cluster after tuning
+stopCluster(cl)          # Shut down the parallel cluster
+registerDoSEQ()          # Revert to sequential execution
+message("Parallel backend stopped and reverted to sequential execution.")
+
+
+#visualisatin resultats
+
+autoplot(tune_mlp, metric = "rmse",  scientific = FALSE) +
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+best_rmse_mlp <- select_best(tune_mlp)
+
+final_mlp <- finalize_model(
+  mlp_spec,
+  best_rmse_mlp
+)
+
+final_mlp
+
+
+
+#finalize workflow
+final_wf_mlp <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_mlp) %>% 
+  fit(isavuco_ml_train)
+
+#vip
+mlp_fit <- extract_fit_parsnip(final_wf_mlp)
+#vip(mlp_fit, geom = "point", num_features = 20) + theme_bw()
+
+###resample#####
+set.seed(123)
+mlp_rs<- fit_resamples(object = final_wf_mlp, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+mlp_rs %>% collect_metrics()
+
+pred_obs_mlp<- mlp_rs %>% collect_predictions() %>%
+   mutate (bias_rel = (.pred - auc_024)/auc_024,
+          bias_rel_square = bias_rel * bias_rel)
+# write.csv2(pred_obs_xgb, file = "pred_obs_xgb_tac_c0h.csv")
+
+#relative bias & rmse
+pred_obs_mlp %>% summarise(biais_rel = mean(bias_rel), relative_rmse = sqrt(mean(bias_rel_square)))
+
+
+mlp_rs %>%
+  collect_predictions() %>%
+  ggplot(mapping = aes(y = .pred, x = auc_024)) +
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title = "Scatter plot ipred/DV", x = "True AUC isavuconazole", y = "predicted auc") + 
+  theme_bw()
+
+
+##fit workflow
+fit_workflow_mlp <- fit(final_wf_mlp, isavuco_ml_train)
+ saveRDS(fit_workflow_mlp, file = str_c("wf_reg_mlp_workshop_save_",today(),".rds"))
+```
+
+## RF : Random Forest
+
+#### model & workflow
+
+Tuning Parameters
+This model has 3 tuning parameters:
+
+mtry: # Randomly Selected Predictors (type: integer, default: see below)
+
+trees: # Trees (type: integer, default: 500L)
+
+min_n: Minimal Node Size (type: integer, default: see below)
+
+
+
+```{r wf rf sim , cache=T, fig.width=10, fig.height=7}
+#model
+##nouveau parametre stop_iter
+rf_spec <- rand_forest(mode = "regression",
+                        mtry = tune(),
+                        trees = 1000,
+                        min_n = tune()
+                        ) %>% set_engine("ranger", importance = "permutation")
+
+
+#workflow model+recipe
+rf_wf<- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(rf_spec)
+#
+
+
+#tuning
+set.seed(345)
+
+tune_rf <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = 20, 
+  control = control_grid(
+    verbose = TRUE, save_pred = TRUE, save_workflow = TRUE
+  )
+)
+
+
+
+#visualisatin resultats
+
+autoplot(tune_rf, metric = "rmse",  scientific = FALSE) +
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+best_rmse_rf <- select_best(tune_rf)
+
+final_rf <- finalize_model(
+  rf_spec,
+  best_rmse_rf
+)
+
+final_rf
+
+
+
+#finalize workflow
+final_wf_rf <- workflow() %>%
+  add_recipe(isavuco_ml_rec) %>%
+  add_model(final_rf) %>% 
+  fit(isavuco_ml_train)
+
+#vip
+rf_fit <- extract_fit_parsnip(final_wf_rf)
+vip(rf_fit, geom = "point", num_features = 20) + theme_bw()
+
+###resample#####
+set.seed(123)
+rf_rs<- fit_resamples(object = final_wf_rf, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+rf_rs %>% collect_metrics()
+
+pred_obs_rf<- rf_rs %>% collect_predictions() %>%
+   mutate (bias_rel = (.pred - auc_024)/auc_024,
+          bias_rel_square = bias_rel * bias_rel)
+# write.csv2(pred_obs_xgb, file = "pred_obs_xgb_tac_c0h.csv")
+
+#relative bias & rmse
+pred_obs_rf %>% summarise(biais_rel = mean(bias_rel), relative_rmse = sqrt(mean(bias_rel_square)))
+
+
+rf_rs %>%
+  collect_predictions() %>%
+  ggplot(mapping = aes(x = .pred, y = auc_024)) +
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title = "Scatter plot ipred/DV", x = "True AUC isavuconazole", y = "predicted auc") + 
+  theme_bw()
+
+
+##fit workflow
+fit_workflow_rf <- fit(final_wf_rf, isavuco_ml_train)
+ saveRDS(fit_workflow_rf, file = str_c("wf_reg_rf_workshop_save_",today(),".rds"))
+```
 
 ## Benchmark other models
 
@@ -1068,6 +1315,9 @@ Use of Xgb
 final_res <- final_wf_xgb_non_fit %>% #mettre wf meilleures perf
   last_fit(isavuco_split)
 
+# final_res <- final_wf_xgb %>% #mettre wf meilleures perf
+#   augment(isavuco_ml_test)
+
 ## performances biais imprecision test
 final_res %>% collect_metrics()
 
@@ -1084,19 +1334,19 @@ rmarkdown::paged_table(as.data.frame(final_res_predictions %>% summarise(biais_r
 
 #pred scatterplot
 final_res_predictions %>%
-  ggplot(mapping = aes(x =AUC_pred, y = auc_024)) +
+  ggplot(mapping = aes(y =AUC_pred, x = auc_024)) +
   geom_point() +
 geom_smooth(method=lm,color = "black")+labs(
-    x = "Predicted AUC (mg*h/L)",
-    y = "Reference AUC (mg*h/L)")+  theme_bw()
+    y = "Predicted AUC (mg*h/L)",
+    x = "Reference AUC (mg*h/L)")+  theme_bw()
 
 #residual scatterplot
 final_res_predictions %>%
   ggplot(mapping = aes(x = AUC_pred, y = AUC_pred - auc_024)) +
   geom_point() +
 geom_smooth(method=lm,color = "black")+labs(
-    x = "Bias AUC (mg*h/L)",
-    y = "Reference AUC (mg*h/L)")+  theme_bw()
+    y = "Bias AUC (mg*h/L)",
+    x = "Reference AUC (mg*h/L)")+  theme_bw()
 
 
 # Passes data to the blandr.statistics function to generate Bland-Altman statistics
@@ -1109,10 +1359,8 @@ blandr.plot.ggplot( statistics.results , plotTitle = "" , ciDisplay = F, ciShadi
 ## VIP plot test set
 
 ```{r}
-library(vip)
-
 xgb_fit <- extract_fit_parsnip(final_res)
-vip(xgb_fit, geom = "point", num_features = 5) + theme_bw()
+vip(xgb_fit, geom = "point", num_features = 10) + theme_bw()
 ```
 
 ## Shapvalues
@@ -1121,18 +1369,18 @@ vip(xgb_fit, geom = "point", num_features = 5) + theme_bw()
 #
 library(shapviz)
 
-# isavuco_ml_rec  <- recipe(auc_024 ~ ., data = isavuco_ml_train) %>%
-#   update_role(id, new_role = "id") %>% 
-#   step_rm(dose_group) %>%
-#   step_log(contains("conc"), offset = 0.0001) %>%
-#   step_YeoJohnson(dose) %>%
-#   step_normalize(all_numeric_predictors()) 
-# # si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
-# # si trop de categories reduire avec step_other
-# 
-# isavuco_ml_rec_prep <-  prep(isavuco_ml_rec )
-# isavuco_train_recipe <-bake(isavuco_ml_rec_prep, new_data = NULL)
-# isavuco_test_recipe <-bake(isavuco_ml_rec_prep, new_data = isavuco_ml_test)
+isavuco_ml_rec  <- recipe(auc_024 ~ ., data = isavuco_ml_train) %>%
+  update_role(id, new_role = "id") %>%
+  step_rm(dose_group) %>%
+  step_log(contains("conc"), offset = 0.0001) %>%
+  step_YeoJohnson(dose) %>%
+ step_normalize(all_numeric_predictors())
+# si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
+# si trop de categories reduire avec step_other
+
+isavuco_ml_rec_prep <-  prep(isavuco_ml_rec )
+isavuco_train_recipe <-bake(isavuco_ml_rec_prep, new_data = NULL)
+isavuco_test_recipe <-bake(isavuco_ml_rec_prep, new_data = isavuco_ml_test)
 
 
 xgb_test_recipe_shap <- bake(
@@ -1199,18 +1447,69 @@ print(dep_plot)
 
 ```
 
-individual force plot
+individual force plot transformed scale
 
 ```{r}
 # Generate force plot for Class 1
-force_plot <- sv_force(shap, row_id = 1) +
+force_plot <- sv_force(shap, row_id = 80) +
   ggtitle("Force Plot")
 
 # Display the plots
 print(force_plot)
+
+# warerfall plot$
+sv_waterfall(shap, row_id = 1) +
+  ggtitle("Force Plot")
 ```
 
+### plot in the original scale: reverse transform
 
+```{r}
+
+
+# Extract SHAP values from the trained model
+shap_values <- shapviz(extract_fit_engine(final_wf_xgb), 
+                       X_pred = xgb_test_recipe_shap, 
+                       X = isavuco_test_recipe)
+
+# Retrieve preprocessed data and transformation parameters
+normalize_step <- isavuco_ml_rec_prep$steps[[which(sapply(isavuco_ml_rec_prep$steps, function(x) "step_normalize" %in% class(x)))]]
+means <- normalize_step$means
+sds <- normalize_step$sds
+
+# Convert to tibble to ensure compatibility
+shap_values$X <- as_tibble(shap_values$X)
+
+# Reverse normalization transformation
+reverse_transform <- function(data, means, sds) {
+  for (col in names(means)) {
+    if (col %in% colnames(data)) {
+      data[[col]] <- data[[col]] * sds[col] + means[col]
+    }
+  }
+  return(data)
+}
+
+# Apply inverse transformation
+shap_values$X <- reverse_transform(shap_values$X, means, sds)
+
+# Reverse log transformation for concentration variables
+log_vars <- grep("conc", colnames(shap_values$X), value = TRUE)
+for (col in log_vars) {
+  shap_values$X[[col]] <- exp(shap_values$X[[col]]) - 0.0001  # Reverse log transformation
+}
+
+# SHAP Force Plot (on original scale)
+sv_force(shap_values, row_id = 200) + ggtitle("SHAP Force Plot (Original Scale)")
+sv_force(shap_values, row_id = 80) + ggtitle("SHAP Force Plot (Original Scale)")
+
+# SHAP Dependence Plot (on original scale)
+dep_plot <- sv_dependence(shap_values, "conc_0", color_var = "dose") +
+  ggtitle("SHAP Dependence Plot (Original Scale)")
+
+print(dep_plot)
+
+```
 
 ## Explainer
 
@@ -1279,9 +1578,12 @@ isavuco_data_st <-
   stacks() %>%
   #results of tune_grid
   add_candidates(tune_lm) %>%
-  add_candidates(tune_mars) %>% 
-  add_candidates(tune_svm) %>% 
-  add_candidates(tune_xgb)
+  add_candidates(tune_rf) %>% 
+  add_candidates(tune_mlp) %>% 
+  add_candidates(tune_xgb) %>% 
+  add_candidates(tune_mars) %>%
+  add_candidates(tune_svm)
+  
 
 as_tibble(isavuco_data_st)
 ```
@@ -1291,6 +1593,9 @@ as_tibble(isavuco_data_st)
 The blend_predictions function determines how member model output will ultimately be combined in the final prediction by fitting a LASSO model on the data stack, predicting the true assessment set outcome using the predictions from each of the candidate members. Candidates with nonzero stacking coefficients become members.
 
 ```{r}
+conflicted::conflicts_prefer(brulee::coef)
+
+set.seed(1234)
 isavuco_model_st <-
   isavuco_data_st %>%
   blend_predictions()
@@ -1306,7 +1611,7 @@ autoplot(isavuco_model_st, type = "members")
 
 ```
 
-The regularized linear regression meta-learning model contained seven blending coefficients across four types of models. The autoplot() method can be used again to show the contributions of each model type,
+The autoplot() method can be used again to show the contributions of each model type,
 
 ```{r}
 autoplot(isavuco_model_st, type = "weights")
@@ -1317,7 +1622,8 @@ autoplot(isavuco_model_st, type = "weights")
 Model stacks can be thought of as a group of fitted member models and a set of instructions on how to combine their predictions.
 
 ```{r}
-isavuco_model_st <-
+set.seed(1234)
+isavuco_model_st_fitted <-
   isavuco_model_st %>%
   fit_members()
 ```
@@ -1330,7 +1636,7 @@ using the stack
 reg_metrics <- metric_set(rmse, rsq)
 
 stack_test_predictions <- 
-augment(isavuco_model_st, isavuco_ml_test)
+augment(isavuco_model_st_fitted, isavuco_ml_test)
 
 stack_test_predictions %>% 
   reg_metrics(auc_024, .pred)
@@ -1355,7 +1661,7 @@ Comparison stack object and indivudal members predictions for rmse for example
 # Generate predictions for each ensemble member
 member_preds <- isavuco_ml_test %>%
   select(auc_024) %>%
-  bind_cols(predict(isavuco_model_st, isavuco_ml_test, members = TRUE))
+  bind_cols(predict(isavuco_model_st_fitted, isavuco_ml_test, members = TRUE))
 
 # Compute RMSE for each member model correctly
 rmse_results <- member_preds %>%
