@@ -1,0 +1,462 @@
+---
+title: "souleiman_ws_ml"
+author: "jbw"
+date: "2025-02-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Here we do not transform the spectrum before the anlaysis
+
+## Loading the packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr)# pour summary
+library(GGally)# pour graphique summary
+library(tableone)# pour stat descriptive
+tidymodels_prefer()
+library(DALEXtra)# pour explicability
+library(themis)# pour downsample
+library(DataExplorer)
+#library(recipeselectors)
+library(naniar)
+library(finetune)
+library(stacks)
+library(vip)
+library(embed)
+```
+
+Loading the data
+
+```{r}
+old_ALBOM <- read.csv("~/Desktop/workshop_norway/150623_ALBOM_sciex.csv", 
+                      sep=";", 
+                      dec=",", 
+                      na.strings = c("DM", NA, "")) %>% 
+  as_tibble() %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(fibrose)) %>% 
+  select(-starts_with("x")) %>% 
+  mutate(creatinine =   parse_number(creatinine),
+         inr =   parse_number(inr),
+         ascite = if_else(ascite =="absente", "absente", "presente"),
+         encephalopathie = if_else(encephalopathie =="absente", "absente", "presente")
+         ) %>% 
+  mutate_if(is.character, factor) %>% 
+  select(age, sexe, ddn, date_inclusion, fibrose, child, elasticite_hepatique_k_pa, score_fib4, plaquettes, ascite, encephalopathie,tp, albumine:creatinine, meld) 
+
+old_ALBOM_disease <- old_ALBOM %>% filter(fibrose != "Témoin")
+old_ALBOM_temoin <- old_ALBOM %>% filter(fibrose == "Témoin")
+
+summary(old_ALBOM)
+```
+
+```{r}
+library(readr)
+albom2025 <- read_delim("albom2025.csv", 
+    delim = ";", escape_double = FALSE, locale = locale(decimal_mark = ".", 
+        grouping_mark = ""), na = c("NA", ""), trim_ws = TRUE) %>% 
+  janitor::clean_names() %>% 
+  mutate(fibrose = if_else(is.na(fibrose), "Témoin", fibrose)) %>% 
+  select(-id_patients:-n, -initiale_nom:-initiale_9, -med, -child:-codes_albom )
+
+albom2025_disease <-  albom2025 %>% filter(fibrose != "Témoin")
+albom2025_temoin <-  albom2025 %>% filter(fibrose == "Témoin")
+```
+
+Merge of the 2 files based on ddn, date_inclusion, age, sexe, fibrose
+
+```{r}
+albom_disease <- old_ALBOM_disease %>% left_join(albom2025_disease) %>% filter(!is.na(id))
+
+albom_temoin <- old_ALBOM_temoin%>% left_join(albom2025_temoin) %>% distinct(x66000_3125, .keep_all = TRUE)
+
+albom <- albom_disease %>% 
+  bind_rows(albom_temoin) %>% 
+  mutate(fibrose = case_when(
+    fibrose == "F2" ~ "F2/F3",
+    fibrose == "F3" ~ "F2/F3",
+    TRUE ~ fibrose))
+
+count(albom,fibrose)
+
+```
+
+
+## data exploration
+
+
+### summary of data
+
+```{r}
+skim(albom)
+```
+
+Visualisation of missing data
+
+```{r}
+vis_miss(albom) + theme(
+  axis.text = element_text(size = 3),  # Adjust the size as needed
+  axis.title = element_text(size = 6) # Adjust the size as needed
+)
+```
+
+## graphical exploration
+
+Graphical exploraiton boxplots package DataExplorer
+
+```{r}
+# boxplots
+plot_boxplot(albom , by ="fibrose", scale_y = "log10", ggtheme = theme_bw()) 
+# variables continues
+plot_histogram(albom, scale_x = "log10", ggtheme = theme_bw())  
+
+# variables categorielle
+# par sous-groupes
+plot_bar(albom, by ="fibrose") 
+```
+
+Based on exploration we will only select the PC to predict fibrosis
+
+```{r}
+albom_ml <-albom %>% select(id, fibrose, starts_with("x"))
+```
+
+
+## data splitting
+
+```{r}
+set.seed(2025)
+albom_split<- initial_split(albom_ml, strata = fibrose, prop=3/4)
+albom_ml_train  <- training(albom_split )
+albom_ml_test  <- testing(albom_split )
+
+albom_ml_train %>% count(fibrose)
+albom_ml_test %>% count(fibrose)
+
+```
+
+
+## Resampling object
+
+```{r}
+#hyperparameters
+set.seed(2345)
+folds <- vfold_cv(albom_ml_train, strata = fibrose, v = 5)# 
+
+###resample#####
+set.seed(456)
+folds_cv <- vfold_cv(albom_ml_train, strata = fibrose, v = 5)#
+```
+
+## pre processing
+
+<https://recipes.tidymodels.org/reference/index.html>
+
+Normalisations usuelles à appliquer par algortihme utilisés
+https://www.tmwr.org/pre-proc-table.html
+
+```{r recipe xgb }
+albom_ml_train %>% mutate_if(is.character, factor) %>% summary()
+
+albom_ml_rec  <- recipe(fibrose ~ ., data = albom_ml_train) %>%
+  update_role(id, new_role = "id") %>%
+  step_nzv(contains("x")) %>% 
+  step_YeoJohnson(contains("x")) %>%
+  step_normalize(all_numeric_predictors()) # %>%
+  #step_upsample(fibrose)
+  #step_smote(fibrose)
+
+
+# si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
+# si trop de categories reduire avec step_other
+
+albom_ml_rec_prep <-  prep(albom_ml_rec )
+albom_train_recipe <-bake(albom_ml_rec_prep, new_data = NULL)
+albom_test_recipe <-bake(albom_ml_rec_prep, new_data = albom_ml_test)
+
+# plot proportion
+albom_train_recipe %>% 
+  ggplot((aes(x=fibrose))) + 
+  geom_bar() + 
+  theme_bw()
+
+# plot proportion
+albom_test_recipe %>% 
+  ggplot((aes(x=fibrose))) + 
+  geom_bar() + 
+  theme_bw()
+```
+
+
+## model & workflow Xgboost
+
+https://parsnip.tidymodels.org/reference/boost_tree.html
+
+Parameters to tune
+
+* mtry
+A number for the number (or proportion) of predictors that will be randomly sampled at each split when creating the tree models
+
+* trees
+An integer for the number of trees contained in the ensemble.
+
+* min_n
+An integer for the minimum number of data points in a node that is required for the node to be split further.
+
+* tree_depth
+An integer for the maximum depth of the tree (i.e. number of splits) (specific engines only).
+
+* learn_rate
+A number for the rate at which the boosting algorithm adapts from iteration-to-iteration (specific engines only). This is sometimes referred to as the shrinkage parameter.
+
+* sample_size
+A number for the number (or proportion) of data that is exposed to the fitting routine. For xgboost, the sampling is done at each iteration 
+
+```{r wf xgb 1}
+# #model
+
+
+xgb_spec <- boost_tree(mode = "classification",
+                        mtry = tune(),
+                        trees = tune(),
+                        min_n = tune(),
+                       sample_size = tune(),
+                        tree_depth = tune(),
+                        learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+
+
+#workflow model+recipe
+xgb_wf <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(xgb_spec)
+#
+
+```
+
+### Tuning
+
+```{r wf xgb tune , cache=TRUE}
+#define metrics of interezst
+# Groups are respected on the new metric function
+#class_metrics <- metric_set(accuracy, roc_auc, f_meas_beta2)
+library(finetune)
+library(doParallel)
+# Step 1: Set up parallel backend
+num_cores <- parallel::detectCores() - 1  # Use all but one core to leave resources for the system
+cl <- makeCluster(num_cores)             # Create a cluster with the specified number of cores
+registerDoParallel(cl)                   # Register the cluster for parallel processing
+
+# Inform the user about the parallel setup
+message("Parallel backend set up with ", num_cores, " cores.")
+
+# Step 2: Define the tuning process with parallel control
+set.seed(234)  # Set seed for reproducibility
+
+# tune_xgb <- tune_grid(
+#   xgb_wf,  # Workflow object
+#   resamples = folds,  # Cross-validation folds
+#   grid = 60,  # Number of tuning parameter combinations
+#   #metrics = class_metrics, # speciy the metrics of interest
+#   control = control_grid(
+#     verbose = TRUE,          # Display progress
+#     allow_par = TRUE,        # Enable parallel processing
+#     parallel_over = "everything" , # Parallelize across resamples and grid combinations
+#     save_pred = TRUE,
+#     save_workflow = TRUE
+#   )
+# )
+
+tune_xgb_ft <-
+  tune_race_anova(
+    xgb_wf,
+    folds,
+    grid = 60,
+   # metrics = metric_set(mn_log_loss, accuracy),
+    control = control_race(
+      verbose_elim = TRUE,
+      allow_par = TRUE,        # Enable parallel processing
+    parallel_over = "everything" , # Parallelize across resamples and grid combinations
+    save_pred = TRUE,
+    save_workflow = TRUE)
+  )
+
+
+# Step 3: Stop the cluster after tuning
+stopCluster(cl)          # Shut down the parallel cluster
+registerDoSEQ()          # Revert to sequential execution
+message("Parallel backend stopped and reverted to sequential execution.")
+
+#View results resultats
+tune_xgb_ft
+plot_race(tune_xgb_ft)
+```
+
+### Selection of the best model
+
+```{r wf xgb  ,fig.width=10, fig.height=7}
+#visualisation des meilleures combinaisons
+show_best(tune_xgb_ft, metric = "accuracy")
+
+#choix du best model
+best_rmse_xgb <- select_best(tune_xgb_ft, metric = "accuracy")
+
+final_xgb <- finalize_model(
+  xgb_spec,
+  best_rmse_xgb
+)
+
+final_xgb
+```
+
+## finalise workflow
+
+```{r finalise xgb workflow}
+#finalize workflow (fitted)
+final_wf_xgb <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_xgb) %>% 
+  fit(albom_ml_train)
+
+#finalize workflow (non fitted for last fit)
+final_wf_xgb_non_fit <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_xgb) 
+
+```
+
+## importance plot
+
+Allows to evaluate which variable are of interest and their weights
+
+```{r wf xgb  importance plot}
+library(vip)
+xgb_fit <- extract_fit_parsnip(final_wf_xgb)
+vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
+```
+
+## crossvalidation
+
+```{r wf xgb cross val resample}
+
+## 10 fold CV
+xgb_rs<- fit_resamples(object = final_wf_xgb, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+xgb_rs %>% collect_metrics()
+
+xgb_rs%>% collect_predictions() %>%
+  conf_mat(fibrose, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+xgb_rs%>% collect_predictions() %>% sens(fibrose, .pred_class)
+xgb_rs%>% collect_predictions() %>% roc_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+xgb_rs%>% collect_predictions() %>% pr_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+```
+Fit and save wf for future use
+```{r fit and save xgb}
+##fit workflow necessaire pour faire prédiciton à partir de l'objet
+fit_workflow <- fit(final_wf_xgb, albom_ml_train)
+
+# ex prediciton à partir du wf pour 3 first patients de train
+set.seed(1234)
+augment(fit_workflow, albom_ml_train %>% slice_head(n = 3)) 
+
+ # sauvegarde pour une utilisation ultérieure
+ saveRDS(fit_workflow, file = str_c("xgboost_classif_albom_save_",today(),".rds"))
+```
+
+## validation test
+
+Use of xgb
+
+```{r last fit xgb}
+## last fit
+
+final_res <- final_wf_xgb %>% #mettre wf meilleures perf
+  augment(albom_ml_test %>% mutate_if(is.character, factor))
+
+final_res %>%
+  conf_mat(fibrose, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+# accuracy, sens, spec, prec ision, recall=sens, auc roc
+final_res %>% accuracy(fibrose, .pred_class)
+final_res %>% yardstick::sens(fibrose, .pred_class) #, fibrose_level="second", estimator = "binary")
+final_res %>% yardstick::spec(fibrose, .pred_class)
+final_res %>% yardstick::precision(fibrose, .pred_class)# precision = vpp
+final_res %>% yardstick::recall(fibrose, .pred_class)# recall = sensitivty
+final_res %>% yardstick::npv(fibrose, .pred_class)# recall = sensitivty
+final_res %>% roc_auc(fibrose, '.pred_F0/F1':'.pred_Témoin')
+final_res %>% pr_auc(fibrose, '.pred_F0/F1':'.pred_Témoin')
+
+#precision recall curve
+final_res %>% pr_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+final_res %>% roc_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+# plot roc curve
+# roc curve
+roc_curve_xgb <- final_res %>%
+  roc_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>%
+  ggplot(aes(1 - specificity, sensitivity, color = .level)) +
+  geom_abline(lty = 2, color = "gray80", linewidth = 1.5) +
+  geom_path(alpha = 0.8, size = 1.2) +
+  coord_equal() + theme_bw()
+
+roc_curve_xgb
+```
+
+## VIP plot test set
+
+```{r vip test}
+xgb_fit <- extract_fit_parsnip(final_wf_xgb)
+vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
+
+```
+
+
+
+## Explainer
+
+```{r explainer rf dalex}
+## creation of explainer
+explainer_external <- explain_tidymodels(
+  model = final_wf_xgb, 
+  data = albom_ml_train, 
+  y = albom_ml_train$event,
+  label = "rf")
+```
+
+### Breakdown plot
+
+https://github.com/pbiecek/breakDown & https://arxiv.org/abs/1804.01955
+
+
+There are multiple possible approaches to understanding why a model predicts a given class. One is a break-down explanation: it computes how contributions attributed to individual features change the mean model’s prediction for a particular observation.
+
+```{r bd plot}
+bd_plot <- predict_parts(explainer = explainer_external,
+                       new_observation = slice_sample(albom_ml_test, n=1),
+                       type = "break_down")
+plot(bd_plot, max_features = 5)
+```
+
+### Partial dependence plot
+
+Partial dependence profiles show how the expected value of a model prediction changes as a function of a feature.
+
+```{r pdp plot}
+pdp_x66898_46875 <- model_profile(
+  explainer_external,
+  variables = "x66898_46875",
+  N = NULL # nombre observation a utilsier de notre trainiong set si null=all
+)
+plot(pdp_x66898_46875)
+
+```

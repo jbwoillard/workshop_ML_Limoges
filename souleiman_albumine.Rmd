@@ -1,0 +1,679 @@
+---
+title: "souleiman_ws_ml"
+author: "jbw"
+date: "2025-02-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+## Loading the packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr)# pour summary
+library(GGally)# pour graphique summary
+library(tableone)# pour stat descriptive
+tidymodels_prefer()
+library(DALEXtra)# pour explicability
+library(themis)# pour downsample
+library(DataExplorer)
+#library(recipeselectors)
+library(naniar)
+library(finetune)
+library(stacks)
+library(vip)
+library(embed)
+```
+
+Loading the data
+
+```{r}
+old_ALBOM <- read.csv("~/Desktop/workshop_norway/150623_ALBOM_sciex.csv", 
+                      sep=";", 
+                      dec=",", 
+                      na.strings = c("DM", NA, "")) %>% 
+  as_tibble() %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(fibrose)) %>% 
+  select(-starts_with("x")) %>% 
+  mutate(creatinine =   parse_number(creatinine),
+         inr =   parse_number(inr),
+         ascite = if_else(ascite =="absente", "absente", "presente"),
+         encephalopathie = if_else(encephalopathie =="absente", "absente", "presente")
+         ) %>% 
+  mutate_if(is.character, factor) %>% 
+  select(age, sexe, ddn, date_inclusion, fibrose, child, elasticite_hepatique_k_pa, score_fib4, plaquettes, ascite, encephalopathie,tp, albumine:creatinine, meld) 
+
+old_ALBOM_disease <- old_ALBOM %>% filter(fibrose != "Témoin")
+old_ALBOM_temoin <- old_ALBOM %>% filter(fibrose == "Témoin")
+
+summary(old_ALBOM)
+```
+
+```{r}
+library(readr)
+albom2025 <- read_delim("albom2025.csv", 
+    delim = ";", escape_double = FALSE, locale = locale(decimal_mark = ".", 
+        grouping_mark = ""), na = c("NA", ""), trim_ws = TRUE) %>% 
+  janitor::clean_names() %>% 
+  mutate(fibrose = if_else(is.na(fibrose), "Témoin", fibrose)) %>% 
+  select(-id_patients:-n, -initiale_nom:-initiale_9, -med, -child:-codes_albom )
+
+albom2025_disease <-  albom2025 %>% filter(fibrose != "Témoin")
+albom2025_temoin <-  albom2025 %>% filter(fibrose == "Témoin")
+```
+
+Merge of the 2 files based on ddn, date_inclusion, age, sexe, fibrose
+
+```{r}
+albom_disease <- old_ALBOM_disease %>% left_join(albom2025_disease) %>% filter(!is.na(id))
+
+albom_temoin <- old_ALBOM_temoin%>% left_join(albom2025_temoin) %>% distinct(x66000_3125, .keep_all = TRUE)
+
+albom <- albom_disease %>% 
+  bind_rows(albom_temoin) %>% 
+  mutate(fibrose = case_when(
+    fibrose == "F2" ~ "F2/F3",
+    fibrose == "F3" ~ "F2/F3",
+    TRUE ~ fibrose))
+
+count(albom,fibrose)
+
+```
+
+
+## PCA to reduce dimension
+
+```{r}
+
+# Select only columns that start with "x"
+selected_data <- albom %>% select(starts_with("x"))
+# Select rows with NA values in any column
+#rows_with_na <- selected_data %>% filter(if_any(everything(), is.na))
+
+# Define PCA recipe
+pca_recipe <- recipe(~., data = selected_data) %>%
+  step_normalize(all_numeric()) %>%  # Normalize numeric variables
+  step_pca(all_numeric(), threshold = 0.9)  # Perform PCA with 90% of the varibaility conserved
+
+# Prep and bake the recipe
+pca_prep <- prep(pca_recipe)
+pca_data <- bake(pca_prep, new_data = selected_data)
+
+# Print the transformed dataset
+pca_data <- pca_data %>%
+  bind_cols(albom %>% select(fibrose)) %>% 
+  relocate(fibrose, everything())
+
+# Plot PCA results
+ggplot(pca_data, aes(x = PC01, y = PC02, color = fibrose)) +
+  geom_point(alpha = 0.8, size = 3) +  # Scatter plot of PCA
+#  scale_color_manual(values = c("red", "blue")) +  # Color by albom (0=red, 1=blue)
+  labs(title = "PCA Analysis of Continuous Variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "fibrose") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+```
+
+
+## UMAP to reduce dimension
+
+```{r}
+
+# Select only columns that start with "x"
+selected_data <- albom %>% select(starts_with("x"))
+# Select rows with NA values in any column
+#rows_with_na <- selected_data %>% filter(if_any(everything(), is.na))
+
+# Define umap recipe
+umap_recipe <- recipe(~., data = selected_data) %>%
+  step_normalize(all_numeric()) %>%  # Normalize numeric variables
+  step_umap(all_numeric(), num_comp = 40)  # 40 cmoponent
+
+# Prep and bake the recipe
+umap_prep <- prep(umap_recipe)
+umap_data <- bake(umap_prep, new_data = selected_data)
+
+# Print the transformed dataset
+umap_data <- umap_data %>%
+  bind_cols(albom %>% select(fibrose)) %>% 
+  relocate(fibrose, everything())
+
+# Plot umap results
+ggplot(umap_data, aes(x = PC01, y = PC02, color = fibrose)) +
+  geom_point(alpha = 0.8, size = 3) +  # Scatter plot of umap
+#  scale_color_manual(values = c("red", "blue")) +  # Color by albom (0=red, 1=blue)
+  labs(title = "umap Analysis of Continuous Variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "fibrose") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+```
+
+Add PC instead of origninal values
+
+```{r}
+# Bind PCA-transformed columns back to original dataset
+albom_pca <- albom %>%
+  select(-starts_with("x")) %>%  # Remove original _x columns
+  bind_cols(pca_data %>% select(-fibrose))  # Add PCA-transformed components
+
+# Print the transformed dataset
+print(albom_pca)
+```
+
+## data exploration
+
+
+### summary of data
+
+```{r}
+skim(albom_pca)
+```
+
+Visualisation of missing data
+
+```{r}
+vis_miss(albom_pca) + theme(
+  axis.text = element_text(size = 3),  # Adjust the size as needed
+  axis.title = element_text(size = 6) # Adjust the size as needed
+)
+```
+
+## graphical exploration
+
+Graphical exploraiton boxplots package DataExplorer
+
+```{r}
+# boxplots
+plot_boxplot(albom_pca , by ="fibrose", scale_y = "log10", ggtheme = theme_bw()) 
+# variables continues
+plot_histogram(albom_pca, scale_x = "log10", ggtheme = theme_bw())  
+
+# variables categorielle
+# par sous-groupes
+plot_bar(albom_pca, by ="fibrose") 
+```
+
+Based on exploration we will only select the PC to predict fibrosis
+
+```{r}
+albom_ml <-albom_pca %>% select(id, fibrose, starts_with("PC"))
+```
+
+
+## data splitting
+
+```{r}
+set.seed(2025)
+albom_split<- initial_split(albom_ml, strata = fibrose, prop=3/4)
+albom_ml_train  <- training(albom_split )
+albom_ml_test  <- testing(albom_split )
+
+albom_ml_train %>% count(fibrose)
+albom_ml_test %>% count(fibrose)
+
+
+```
+
+Check of the proportion
+
+```{r}
+albom_dev<-albom_ml_train %>% mutate (type = "dev")
+albom_val<-albom_ml_test %>% mutate (type = "val")
+albom_des<-full_join(albom_dev, albom_val)
+
+#recuperation des noms
+# dput(names((albom_des)))
+## Vector of categorical variables that need transformation
+catVars <- c("fibrose")
+## Create a variable list.
+vars <- c("fibrose", "PC01", "PC02", "PC03", "PC04", "PC05", "PC06", 
+"PC07", "PC08", "PC09", "PC10", "PC11", "PC12", "PC13", "PC14", 
+"PC15", "PC16", "PC17", "PC18", "PC19", "PC20", "PC21", "PC22", 
+"PC23", "PC24", "PC25", "PC26", "PC27", "PC28", "PC29", "PC30", 
+"PC31", "PC32", "PC33", "PC34", "PC35", "PC36", "PC37", "PC38", 
+"PC39", "PC40", "PC41", "PC42", "PC43", "PC44")
+tableOne <- CreateTableOne(vars = vars, strata = "type",factorVars = catVars, data = albom_des)
+tableOne2<-print(tableOne, nonnormal = c("PC01", "PC02", "PC03", "PC04", "PC05", "PC06", 
+"PC07", "PC08", "PC09", "PC10", "PC11", "PC12", "PC13", "PC14", 
+"PC15", "PC16", "PC17", "PC18", "PC19", "PC20", "PC21", "PC22", 
+"PC23", "PC24", "PC25", "PC26", "PC27", "PC28", "PC29", "PC30", 
+"PC31", "PC32", "PC33", "PC34", "PC35", "PC36", "PC37", "PC38", 
+"PC39", "PC40", "PC41", "PC42", "PC43", "PC44"), printToggle=F, minMax=T)
+tableOne2b<-print(tableOne, nonnormal = c("PC01", "PC02", "PC03", "PC04", "PC05", "PC06", 
+"PC07", "PC08", "PC09", "PC10", "PC11", "PC12", "PC13", "PC14", 
+"PC15", "PC16", "PC17", "PC18", "PC19", "PC20", "PC21", "PC22", 
+"PC23", "PC24", "PC25", "PC26", "PC27", "PC28", "PC29", "PC30", 
+"PC31", "PC32", "PC33", "PC34", "PC35", "PC36", "PC37", "PC38", 
+"PC39", "PC40", "PC41", "PC42", "PC43", "PC44"), printToggle=F, minMax=F)
+
+```
+
+
+```{r , echo=F}
+kableone(tableOne2)
+kableone(tableOne2b)
+```
+
+
+## Resampling object
+
+```{r}
+#hyperparameters
+set.seed(2345)
+folds <- vfold_cv(albom_ml_train, strata = fibrose, v = 5)# 
+
+###resample#####
+set.seed(456)
+folds_cv <- vfold_cv(albom_ml_train, strata = fibrose, v = 5)#
+```
+
+## pre processing
+
+<https://recipes.tidymodels.org/reference/index.html>
+
+Normalisations usuelles à appliquer par algortihme utilisés
+https://www.tmwr.org/pre-proc-table.html
+
+```{r recipe xgb }
+albom_ml_train %>% mutate_if(is.character, factor) %>% summary()
+
+albom_ml_rec  <- recipe(fibrose ~ ., data = albom_ml_train) %>%
+  update_role(id, new_role = "id") %>%
+  #step_log(contains("PC"), offset = 0.0001) %>%
+  step_normalize(all_numeric_predictors())  %>%
+  step_upsample(fibrose)
+  #step_smote(fibrose)
+
+
+# si categorical cov, one hot encoding avec step_dummy --> allonge modele rf or xgb : garder factor dans ces modeles
+# si trop de categories reduire avec step_other
+
+albom_ml_rec_prep <-  prep(albom_ml_rec )
+albom_train_recipe <-bake(albom_ml_rec_prep, new_data = NULL)
+albom_test_recipe <-bake(albom_ml_rec_prep, new_data = albom_ml_test)
+
+# plot proportion
+albom_train_recipe %>% 
+  ggplot((aes(x=fibrose))) + 
+  geom_bar() + 
+  theme_bw()
+
+# plot proportion
+albom_test_recipe %>% 
+  ggplot((aes(x=fibrose))) + 
+  geom_bar() + 
+  theme_bw()
+```
+
+
+## model & workflow Xgboost
+
+https://parsnip.tidymodels.org/reference/boost_tree.html
+
+Parameters to tune
+
+* mtry
+A number for the number (or proportion) of predictors that will be randomly sampled at each split when creating the tree models
+
+* trees
+An integer for the number of trees contained in the ensemble.
+
+* min_n
+An integer for the minimum number of data points in a node that is required for the node to be split further.
+
+* tree_depth
+An integer for the maximum depth of the tree (i.e. number of splits) (specific engines only).
+
+* learn_rate
+A number for the rate at which the boosting algorithm adapts from iteration-to-iteration (specific engines only). This is sometimes referred to as the shrinkage parameter.
+
+* sample_size
+A number for the number (or proportion) of data that is exposed to the fitting routine. For xgboost, the sampling is done at each iteration 
+
+```{r wf xgb 1}
+# #model
+
+
+xgb_spec <- boost_tree(mode = "classification",
+                        mtry = tune(),
+                        trees = tune(),
+                        min_n = tune(),
+                       sample_size = tune(),
+                        tree_depth = tune(),
+                        learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+
+
+#workflow model+recipe
+xgb_wf <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(xgb_spec)
+#
+
+```
+
+### Tuning
+
+```{r wf xgb tune , cache=TRUE}
+#define metrics of interezst
+# Groups are respected on the new metric function
+#class_metrics <- metric_set(accuracy, roc_auc, f_meas_beta2)
+
+library(doParallel)
+# Step 1: Set up parallel backend
+num_cores <- parallel::detectCores() - 1  # Use all but one core to leave resources for the system
+cl <- makeCluster(num_cores)             # Create a cluster with the specified number of cores
+registerDoParallel(cl)                   # Register the cluster for parallel processing
+
+# Inform the user about the parallel setup
+message("Parallel backend set up with ", num_cores, " cores.")
+
+# Step 2: Define the tuning process with parallel control
+set.seed(234)  # Set seed for reproducibility
+
+tune_xgb <- tune_grid(
+  xgb_wf,  # Workflow object
+  resamples = folds,  # Cross-validation folds
+  grid = 60,  # Number of tuning parameter combinations
+  #metrics = class_metrics, # speciy the metrics of interest
+  control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    parallel_over = "everything" , # Parallelize across resamples and grid combinations
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+# Step 3: Stop the cluster after tuning
+stopCluster(cl)          # Shut down the parallel cluster
+registerDoSEQ()          # Revert to sequential execution
+message("Parallel backend stopped and reverted to sequential execution.")
+
+#View results resultats
+
+autoplot(tune_xgb, scientific = FALSE) +
+  theme_bw() +
+  ggtitle("tuning hyperparameter")
+```
+
+### Selection of the best model
+
+```{r wf xgb  ,fig.width=10, fig.height=7}
+#visualisation des meilleures combinaisons
+show_best(tune_xgb, metric = "accuracy")
+
+#choix du best model
+best_rmse_xgb <- select_best(tune_xgb, metric = "accuracy")
+
+final_xgb <- finalize_model(
+  xgb_spec,
+  best_rmse_xgb
+)
+
+final_xgb
+```
+
+## finalise workflow
+
+```{r finalise xgb workflow}
+#finalize workflow (fitted)
+final_wf_xgb <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_xgb) %>% 
+  fit(albom_ml_train)
+
+#finalize workflow (non fitted for last fit)
+final_wf_xgb_non_fit <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_xgb) 
+
+```
+
+## importance plot
+
+Allows to evaluate which variable are of interest and their weights
+
+```{r wf xgb  importance plot}
+library(vip)
+xgb_fit <- extract_fit_parsnip(final_wf_xgb)
+vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
+```
+
+## crossvalidation
+
+```{r wf xgb cross val resample}
+
+## 10 fold CV
+xgb_rs<- fit_resamples(object = final_wf_xgb, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+xgb_rs %>% collect_metrics()
+
+xgb_rs%>% collect_predictions() %>%
+  conf_mat(fibrose, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+xgb_rs%>% collect_predictions() %>% sens(fibrose, .pred_class)
+xgb_rs%>% collect_predictions() %>% roc_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+xgb_rs%>% collect_predictions() %>% pr_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+```
+Fit and save wf for future use
+```{r fit and save xgb}
+##fit workflow necessaire pour faire prédiciton à partir de l'objet
+fit_workflow <- fit(final_wf_xgb, albom_ml_train)
+
+# ex prediciton à partir du wf pour 3 first patients de train
+set.seed(1234)
+augment(fit_workflow, albom_ml_train %>% slice_head(n = 3)) 
+
+ # sauvegarde pour une utilisation ultérieure
+ saveRDS(fit_workflow, file = str_c("xgboost_classif_albom_save_",today(),".rds"))
+```
+
+## SVM polynomial model for benchmarking
+
+SVM works by mapping data to a high-dimensional feature space so that data points can be categorized, even when the data are not otherwise linearly separable. A separator between the categories is found, then the data are transformed in such a way that the separator could be drawn as a hyperplane. Following this, characteristics of new data can be used to predict the group to which a new record should belong.
+
+#### model & workflow
+
+https://parsnip.tidymodels.org/reference/svm_poly.html
+
+* cost
+A positive number for the cost of predicting a sample within or on the wrong side of the margin
+
+
+
+```{r wf svm sim , cache=TRUE, fig.width=10, fig.height=7}
+#model
+##nouveau parametre stop_iter
+svm_spec <- svm_linear(mode = "classification",
+                        cost = tune()
+                        ) %>% set_engine("kernlab", importance = "permutation")
+
+
+#workflow model+recipe
+svm_wf<- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(svm_spec)
+#
+# Step 1: Set up parallel backend
+num_cores <- parallel::detectCores() - 1  # Use all but one core to leave resources for the system
+cl <- makeCluster(num_cores)             # Create a cluster with the specified number of cores
+registerDoParallel(cl)                   # Register the cluster for parallel processing
+
+# Inform the user about the parallel setup
+message("Parallel backend set up with ", num_cores, " cores.")
+
+#tuning
+set.seed(345)
+tune_svm <- tune_grid(
+  svm_wf,
+  resamples = folds,
+  grid = 10,
+control = control_grid(
+    verbose = TRUE,          # Display progress
+    allow_par = TRUE,        # Enable parallel processing
+    parallel_over = "everything" , # Parallelize across resamples and grid combinations
+    save_pred = TRUE,
+    save_workflow = TRUE
+  )
+)
+
+# Step 3: Stop the cluster after tuning
+stopCluster(cl)          # Shut down the parallel cluster
+registerDoSEQ()          # Revert to sequential execution
+message("Parallel backend stopped and reverted to sequential execution.")
+
+#visualisatin resultats
+
+autoplot(tune_svm, metric = "accuracy") +
+  ggtitle("tuning hyperparameter")
+
+#choix du best model
+best_rmse_svm <- select_best(tune_svm)
+
+final_svm <- finalize_model(
+  svm_spec,
+  best_rmse_svm
+)
+
+final_svm
+
+#visualisation des résultats
+# final_svm %>%
+#   set_engine("kernlab", importance = "permutation") %>%
+#   fit(auc ~ .,
+#       data = juice(albom_ml_rec_prep)
+#   ) %>%
+#   vip::vip(geom = "col")
+
+#finalize workflow
+final_wf_svm <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_svm)
+
+###resample#####
+set.seed(456)
+folds_cv<- vfold_cv(albom_ml_train, strata = fibrose)#par défaut 10 fois
+set.seed(123)
+svm_rs<- fit_resamples(object = final_wf_svm, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+svm_rs %>% collect_metrics()
+
+svm_rs %>% 
+  collect_predictions() %>%
+  conf_mat(fibrose, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+svm_rs%>% collect_predictions() %>% roc_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+svm_rs%>% collect_predictions() %>% pr_curve(fibrose, '.pred_F0/F1':'.pred_Témoin') %>% autoplot()
+##fit workflow
+fit_workflow_svm <- fit(final_wf_svm, albom_ml_train)
+ saveRDS(fit_workflow_svm, file = "svm_classif_albom_save_",today(),".rds")
+```
+
+## RF : Random Forest
+
+#### model & workflow
+
+Tuning Parameters
+This model has 3 tuning parameters:
+
+mtry: # Randomly Selected Predictors (type: integer, default: see below)
+
+trees: # Trees (type: integer, default: 500L)
+
+min_n: Minimal Node Size (type: integer, default: see below)
+
+
+
+```{r wf rf classification , cache=T, fig.width=10, fig.height=7}
+#model
+##nouveau parametre stop_iter
+rf_spec <- rand_forest(mode = "classification",
+                        mtry = tune(),
+                        trees = 1000,
+                        min_n = tune()
+                        ) %>% set_engine("ranger", importance = "permutation")
+
+
+#workflow model+recipe
+rf_wf<- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(rf_spec)
+#
+
+
+#tuning
+set.seed(345)
+
+tune_rf <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = 20, 
+  control = control_grid(
+    verbose = TRUE, save_pred = TRUE, save_workflow = TRUE
+  )
+)
+
+
+
+#visualisatin resultats
+
+autoplot(tune_rf, metric = "accuracy") +
+  ggtitle("tuning hyperparameter")
+
+
+#choix du best model
+best_rmse_rf <- select_best(tune_rf)
+
+final_rf <- finalize_model(
+  rf_spec,
+  best_rmse_rf
+)
+
+final_rf
+
+
+
+#finalize workflow
+final_wf_rf <- workflow() %>%
+  add_recipe(albom_ml_rec) %>%
+  add_model(final_rf) %>% 
+  fit(albom_ml_train)
+
+#vip
+rf_fit <- extract_fit_parsnip(final_wf_rf)
+vip(rf_fit, geom = "point", num_features = 20) + theme_bw()
+
+###resample#####
+set.seed(123)
+rf_rs<- fit_resamples(object = final_wf_rf, resamples = folds_cv, control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+##perf resample
+rf_rs %>% collect_metrics()
+
+rf_rs %>% 
+  collect_predictions() %>%
+  conf_mat(fibrose, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+##fit workflow
+fit_workflow_rf <- fit(final_wf_rf, albom_ml_train)
+ saveRDS(fit_workflow_rf, file = "rf_classif_albom_save_",today(),".rds")
+```

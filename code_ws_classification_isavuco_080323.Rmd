@@ -35,8 +35,6 @@ library(vip)
 ```
 
 
-
-
 ```{r, include = FALSE}
 library(readr)
 
@@ -124,6 +122,8 @@ creation_event %>%
 
 # proportion
 creation_event %>% summarise(prop_event = mean(event_numeric, na.rm=TRUE))
+
+creation_event <- creation_event %>% select(-event_numeric)
 ```
 
 
@@ -412,7 +412,7 @@ pca_transformed <- bake(pca_prep, new_data = pca_data)
 
 # Combine PCA results with event variable
 pca_transformed <- pca_transformed %>%
-  bind_cols(select(pca_data, event))
+  bind_cols(select(pca_data))
 
 # Plot PCA results
 ggplot(pca_transformed, aes(x = PC1, y = PC2, color = event)) +
@@ -421,7 +421,7 @@ ggplot(pca_transformed, aes(x = PC1, y = PC2, color = event)) +
   labs(title = "PCA Analysis of Continuous Variables",
        x = "Principal Component 1",
        y = "Principal Component 2",
-       color = "Event") +
+       color = "event") +
   theme_minimal() +
   theme(legend.position = "top")
 
@@ -631,7 +631,7 @@ Race approach:  here, the tuning process evaluates all models on an initial subs
 ```{r wf xgb tune , cache=TRUE}
 #define metrics of interezst
 # Groups are respected on the new metric function
-class_metrics <- metric_set(accuracy, roc_auc, f_meas_beta2)
+#class_metrics <- metric_set(accuracy, roc_auc, f_meas_beta2)
 
 library(doParallel)
 # Step 1: Set up parallel backend
@@ -649,7 +649,7 @@ tune_xgb <- tune_grid(
   xgb_wf,  # Workflow object
   resamples = folds,  # Cross-validation folds
   grid = 60,  # Number of tuning parameter combinations
-  metrics = class_metrics, # speciy the metrics of interest
+  #metrics = class_metrics, # speciy the metrics of interest
   control = control_grid(
     verbose = TRUE,          # Display progress
     allow_par = TRUE,        # Enable parallel processing
@@ -743,7 +743,7 @@ xgb_fit <- extract_fit_parsnip(final_wf_xgb)
 vip(xgb_fit, geom = "point", num_features = 20) + theme_bw()
 ```
 
-##ncrossvalidation
+## crossvalidation
 
 ```{r wf xgb cross val resample}
 
@@ -1236,7 +1236,7 @@ tune_rf <- tune_grid(
 
 #visualisatin resultats
 
-autoplot(tune_mlp, metric = "accuracy") +
+autoplot(tune_rf, metric = "accuracy") +
   ggtitle("tuning hyperparameter")
 
 
@@ -1340,11 +1340,13 @@ roc_curve_xgb
 ```{r vip test}
 library(vip)
 
-rf_fit <- extract_fit_parsnip(final_res)
+rf_fit <- extract_fit_parsnip(final_wf_rf)
 vip(rf_fit, geom = "point", num_features = 5) + theme_bw()
 ```
 
 ## Shapvalues
+
+Not supported for RF
 
 ```{r shap xgb}
 #
@@ -1408,15 +1410,16 @@ force_plot <- sv_force(shap, row_id = 1) +
 print(force_plot)
 ```
 
+
 ## Explainer
 
-```{r explainer xgb dalex}
+```{r explainer rf dalex}
 ## creation of explainer
 explainer_external <- explain_tidymodels(
-  model = fit_workflow, 
+  model = final_wf_rf, 
   data = isavuco_ml_train, 
   y = isavuco_ml_train$event,
-  label = "xgb")
+  label = "rf")
 ```
 
 ### Breakdown plot
@@ -1444,6 +1447,13 @@ pdp_diff_conc_12_0 <- model_profile(
   N = NULL # nombre observation a utilsier de notre trainiong set si null=all
 )
 plot(pdp_diff_conc_12_0)
+
+pdp_dose <- model_profile(
+  explainer_external,
+  variables = "dose",
+  N = NULL # nombre observation a utilsier de notre trainiong set si null=all
+)
+plot(pdp_dose)
 ```
 
 # Particular case of equivocal
@@ -1451,8 +1461,13 @@ plot(pdp_diff_conc_12_0)
 If a model result indicated that you had a 51% chance of having contracted COVID-19, it would be natural to view the diagnosis with some skepticism
 
 ```{r equivocal}
-test_pred <- augment(fit_workflow, isavuco_ml_test)
-test_pred %>% head()
+test_pred <- augment(final_wf_rf, isavuco_ml_test) %>% 
+  mutate(missclassified = if_else(.pred_class == event, 0, 1),
+         missclassified = as.factor(missclassified))
+test_pred %>% 
+  ggplot(aes(x = .pred_1, fill = missclassified)) +
+  geom_histogram()
+
 
 ## creation d'une zone equivoque
 library(probably)
@@ -1461,7 +1476,7 @@ lvls <- levels(isavuco_ml_train$event)
 
 test_pred <- 
   test_pred %>% 
-  mutate(.pred_with_eqz = make_two_class_pred(.pred_0, lvls, buffer = 0.15))
+  mutate(.pred_with_eqz = make_two_class_pred(.pred_0, lvls, buffer = 0.06))
 
 test_pred %>% count(.pred_with_eqz) # Rows that are within 0.50±0.15 are given a value of [EQ]
 
@@ -1518,6 +1533,8 @@ score(pca_stat, isavuco_ml_test %>% slice_sample(n=1)) %>% select(starts_with("d
 # Ensemble models
 
 ```{r ensemble stack blend}
+conflicted::conflicts_prefer(kernlab::coef)
+set.seed(1234)
 isavuco_classif_model_st <- 
   # initialize the stack
   stacks() %>%
@@ -1526,8 +1543,9 @@ isavuco_classif_model_st <-
   add_candidates(tune_lm) %>%
   add_candidates(tune_mars) %>%
   add_candidates(tune_svm) %>%
+  add_candidates(tune_rf) %>%
   # determine how to combine their predictions
-  blend_predictions() %>%
+  blend_predictions(metric = metric_set(accuracy)) %>%
   # fit the candidates with nonzero stacking coefficients
   fit_members()
 
@@ -1570,7 +1588,7 @@ isavuco_class_pred_class <- isavuco_class_pred_class %>%
 # ======================================================
 
 # Define classification metrics (for class predictions)
-class_metrics <- metric_set(accuracy, f_meas, sens, spec, ppv, npv)
+class_metrics <- metric_set(accuracy, f_meas, sens, spec, ppv, npv, f_meas_beta2)
 
 # Compute classification metrics using **class predictions**
 classification_results <- isavuco_class_pred_class %>%
@@ -1687,8 +1705,7 @@ isavuco_class_pred <- isavuco_ml_test %>%
     )
   )
 
-# Print the first few rows to verify the structure
-head(isavuco_class_pred)
+
 
 # ==========================================
 # 2️⃣ Evaluate Individual Model Performance
@@ -1704,7 +1721,7 @@ pred_class_isavuco <- map(
 # ==========================================
 # 3️⃣ Display Results in a Table
 # ==========================================
-rmarkdown::paged_table(pred_class_isavuco)
+rmarkdown::paged_table(pred_class_isavuco %>% unnest())
 ```
 
 overall roc curves
@@ -1734,8 +1751,8 @@ roc_curve_data <- isavuco_class_pred %>%
 
 # Plot ROC Curves for all models
 roc_curve_plot <- ggplot(roc_curve_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
-  geom_abline(lty = 2, color = "gray80", linewidth = 1.2) +  # Diagonal reference line
-  geom_path(size = 1.2, alpha = 0.8) +  # ROC curves
+  geom_abline(lty = 2, color = "gray80", linewidth = 1) +  # Diagonal reference line
+  geom_path(size = 1, alpha = 0.8) +  # ROC curves
   labs(title = "ROC Curves for Stacked Model and Members",
        x = "1 - Specificity (False Positive Rate)",
        y = "Sensitivity (True Positive Rate)",
